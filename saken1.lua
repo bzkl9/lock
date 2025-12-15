@@ -1,4 +1,3 @@
--- << whole large script (unchanged) >>
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = workspace
@@ -773,9 +772,6 @@ local DODGE_FORCE_P = 1e4
 local DODGE_FORCE_MAX = Vector3.new(1e5, 1e5, 1e5)
 local DODGE_MAX_SPEED = 19
 
--- Face duration (0.5s requested)
-local FACE_OVERRIDE_DURATION = 0.5
-
 local ENABLE_AUTO_KILL_PREVIOUS = true
 local KILL_HOTKEY = Enum.KeyCode.K
 
@@ -826,8 +822,7 @@ local function findSurvivorsFolder()
 end
 
 local function getModelPosition(model)
-    if not model then return nil
-    end
+    if not model then return nil end
     if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
         return model.PrimaryPart.Position
     end
@@ -947,49 +942,24 @@ local function isPlayingKiller()
     return false
 end
 
--- Interrupt and cleanup any active overrides (dodge or face)
-local function interruptActiveOverrides()
-    -- active dodge cleanup
-    if controller._activeDodge then
-        local info = controller._activeDodge
-        controller._activeDodge = nil
-        pcall(function()
-            if info.bv and info.bv.Parent then
-                info.bv:Destroy()
-            end
-        end)
-        pcall(function()
-            if info.dieConn then info.dieConn:Disconnect() end
-        end)
-        pcall(function()
-            if humanoid then
-                humanoid.WalkSpeed = info.savedWalkSpeed or 16
-                humanoid.AutoRotate = info.savedAutoRotate
-            end
-        end)
-    end
-
-    -- active face cleanup
-    if controller._activeFace then
-        local info = controller._activeFace
-        controller._activeFace = nil
-        pcall(function()
-            if info.bg and info.bg.Parent then
-                info.bg:Destroy()
-            end
-        end)
-        pcall(function()
-            if info.hbConn then info.hbConn:Disconnect() end
-        end)
-        pcall(function()
-            if info.dieConn then info.dieConn:Disconnect() end
-        end)
-        pcall(function()
-            if humanoid and info.savedAutoRotate ~= nil then
-                humanoid.AutoRotate = info.savedAutoRotate
-            end
-        end)
-    end
+local function interruptActiveDodge()
+    if not controller._activeDodge then return end
+    local info = controller._activeDodge
+    controller._activeDodge = nil
+    pcall(function()
+        if info.bv and info.bv.Parent then
+            info.bv:Destroy()
+        end
+    end)
+    pcall(function()
+        if info.dieConn then info.dieConn:Disconnect() end
+    end)
+    pcall(function()
+        if humanoid then
+            humanoid.WalkSpeed = info.savedWalkSpeed or 16
+            humanoid.AutoRotate = info.savedAutoRotate
+        end
+    end)
 end
 
 local function performBackDodgeOverride()
@@ -1068,100 +1038,6 @@ local function performBackDodgeOverride()
     end)
 end
 
--- Face override: instant snap + heartbeat hold so ShiftLock can't fight it.
-local function performFaceOverride(survivor)
-    if not isPlayingKiller() then return end
-    if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
-    lastDodgeTime = tick()
-    if not char or not hrp or not humanoid then return end
-    local sPos = getModelPosition(survivor)
-    if not sPos then return end
-
-    -- Cleanup any active override first
-    interruptActiveOverrides()
-
-    -- Save and disable AutoRotate
-    local savedAutoRotate = humanoid.AutoRotate
-    humanoid.AutoRotate = false
-
-    -- Compute look CFrame (preserve hrp Y for level look)
-    local lookPos = Vector3.new(sPos.X, hrp.Position.Y, sPos.Z)
-    local targetCFrame = CFrame.new(hrp.Position, lookPos)
-
-    -- Instant snap and zero RotVelocity
-    pcall(function()
-        hrp.CFrame = targetCFrame
-        if hrp:IsA("BasePart") then
-            hrp.RotVelocity = Vector3.new(0,0,0)
-        end
-    end)
-
-    -- Backup BodyGyro (not relied on for snapping)
-    local bg = Instance.new("BodyGyro")
-    bg.Name = "AutoReflexFaceGyro"
-    bg.MaxTorque = Vector3.new(1e8, 1e8, 1e8)
-    bg.P = 1e6
-    bg.D = 1
-    bg.CFrame = targetCFrame
-    bg.Parent = hrp
-
-    -- Heartbeat forcing to hold exact orientation (does NOT track survivor movement)
-    local hbConn
-    hbConn = RunService.Heartbeat:Connect(function()
-        if not controller._activeFace then
-            if hbConn then pcall(function() hbConn:Disconnect() end) end
-            return
-        end
-        if hrp and hrp.Parent then
-            local pos = hrp.Position
-            local fixed = CFrame.new(pos, lookPos)
-            hrp.CFrame = fixed
-        end
-    end)
-
-    local dieConn
-    dieConn = humanoid.Died:Connect(function()
-        if bg and bg.Parent then
-            pcall(function() bg:Destroy() end)
-        end
-        if hbConn then
-            pcall(function() hbConn:Disconnect() end)
-        end
-        if dieConn then
-            pcall(function() dieConn:Disconnect() end)
-        end
-    end)
-
-    controller._activeFace = {
-        bg = bg,
-        hbConn = hbConn,
-        savedAutoRotate = savedAutoRotate,
-        dieConn = dieConn
-    }
-
-    if ENABLE_AUTO_KILL_PREVIOUS then
-        killPreviousController()
-    end
-
-    delay(FACE_OVERRIDE_DURATION, function()
-        if not controller._activeFace then return end
-        local info = controller._activeFace
-        controller._activeFace = nil
-        if info.bg and info.bg.Parent then
-            pcall(function() info.bg:Destroy() end)
-        end
-        if info.hbConn then
-            pcall(function() info.hbConn:Disconnect() end)
-        end
-        if humanoid then
-            pcall(function() humanoid.AutoRotate = info.savedAutoRotate end)
-        end
-        if info.dieConn then
-            pcall(function() info.dieConn:Disconnect() end)
-        end
-    end)
-end
-
 local function onResistanceValueChanged(resVal)
     if not resVal then return end
     local v = tonumber(resVal.Value) or 0
@@ -1186,11 +1062,7 @@ local function onResistanceValueChanged(resVal)
     end
     local dist = (hrp.Position - sPos).Magnitude
     if dist <= DODGE_RANGE then
-        if survivor.Name == "TwoTime" then
-            performFaceOverride(survivor)
-        else
-            performBackDodgeOverride()
-        end
+        performBackDodgeOverride()
     end
 end
 
@@ -1287,7 +1159,7 @@ local function onAnimationPlayed(track)
     local idNum = animId:match("(%d+)")
     if not idNum then return end
     if WATCHED_ANIM_IDS[tostring(idNum)] then
-        interruptActiveOverrides()
+        interruptActiveDodge()
     end
 end
 
@@ -1336,7 +1208,7 @@ local function cleanup()
         pcall(function() animatorConnection:Disconnect() end)
         animatorConnection = nil
     end
-    interruptActiveOverrides()
+    interruptActiveDodge()
     if _G.AutoReflexController == controller then _G.AutoReflexController = nil end
     controller.Cleanup = nil
 end
@@ -1353,88 +1225,3 @@ if RunService:IsStudio() then
     warn("[AutoReflex_SpeedAware_0.14sOverride_Range] running. Press 'K' to kill previous controller. Dodge override duration:", DODGE_OVERRIDE_DURATION, "Range:", DODGE_RANGE)
 end
 end
-
--- << Respawn Location ESP ADDED AS A FUNCTION (no changes to other code) >>
-local function RespawnLocationESP()
-    -- Respawn Location ESP (BoxHandleAdornment version)
-    -- LocalScript (place in StarterPlayerScripts)
-
-    local Players = game:GetService("Players")
-    local workspace = game:GetService("Workspace")
-
-    local LOCAL_PLAYER = Players.LocalPlayer
-    if not LOCAL_PLAYER then
-        warn("[RespawnESP] No LocalPlayer; aborting.")
-        return
-    end
-
-    local PLAYER_PREFIX = LOCAL_PLAYER.Name:lower()
-    local SUFFIX = "respawnlocation" -- strict suffix
-
-    local COLOR = BrickColor.new("Lime green")
-    local TRANSPARENCY = 0.5
-
-    local espObjects = {} -- [BasePart] = BoxHandleAdornment
-
-    local function isRespawnName(name)
-        name = tostring(name or ""):lower()
-        return name:sub(-15) == "respawnlocation"
-    end
-
-
-    local function addESP(part)
-        if espObjects[part] then return end
-        if not part or not part:IsA("BasePart") then return end
-
-        local box = Instance.new("BoxHandleAdornment")
-        box.Name = "RespawnESP"
-        box.Adornee = part
-        box.Size = part.Size
-        box.AlwaysOnTop = true
-        box.ZIndex = 0
-        box.Transparency = TRANSPARENCY
-        box.Color = COLOR
-        box.Parent = part
-
-        espObjects[part] = box
-    end
-
-    local function removeESP(part)
-        local box = espObjects[part]
-        if box then
-            box:Destroy()
-            espObjects[part] = nil
-        end
-    end
-
-    local function scan()
-        for _, inst in ipairs(workspace:GetDescendants()) do
-            if inst:IsA("BasePart") and isRespawnName(inst.Name) then
-                addESP(inst)
-            end
-        end
-    end
-
-    -- Initial scan
-    scan()
-
-    -- Catch newly added parts (small wait for replication)
-    workspace.DescendantAdded:Connect(function(inst)
-        if inst:IsA("BasePart") and isRespawnName(inst.Name) then
-            task.wait()
-            addESP(inst)
-        end
-    end)
-
-    -- Cleanup when parts removed
-    workspace.DescendantRemoving:Connect(function(inst)
-        if inst:IsA("BasePart") then
-            removeESP(inst)
-        end
-    end)
-
-    print("[RespawnESP] Active for:", LOCAL_PLAYER.Name .. " + RespawnLocation")
-end
-
--- Note: The RespawnLocationESP function was added but NOT invoked automatically.
--- Call RespawnLocationESP() from wherever you want the ESP to start (e.g. in a StarterPlayerScripts LocalScript).
