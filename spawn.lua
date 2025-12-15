@@ -1,14 +1,25 @@
 -- Respawn Location ESP (BoxHandleAdornment version)
--- LocalScript (place in StarterPlayerScripts)
+-- Hardened for execution via loadstring (waits for LocalPlayer & prints debug)
 
 local Players = game:GetService("Players")
 local workspace = game:GetService("Workspace")
 
+-- Wait for LocalPlayer (gives executors/replication a short window)
 local LOCAL_PLAYER = Players.LocalPlayer
+local max_wait_seconds = 5
+local waited = 0
+while not LOCAL_PLAYER and waited < max_wait_seconds do
+    task.wait(0.05)
+    waited = waited + 0.05
+    LOCAL_PLAYER = Players.LocalPlayer
+end
+
 if not LOCAL_PLAYER then
-    warn("[RespawnESP] No LocalPlayer; aborting.")
+    warn("[RespawnESP] No LocalPlayer found after " .. tostring(max_wait_seconds) .. "s; aborting.")
     return
 end
+
+print("[RespawnESP] Running for LocalPlayer:", LOCAL_PLAYER.Name)
 
 local PLAYER_PREFIX = LOCAL_PLAYER.Name:lower()
 local SUFFIX = "respawnlocation" -- strict suffix
@@ -20,9 +31,8 @@ local espObjects = {} -- [BasePart] = BoxHandleAdornment
 
 local function isRespawnName(name)
     name = tostring(name or ""):lower()
-    return name:sub(-15) == "respawnlocation"
+    return name:sub(-#SUFFIX) == SUFFIX
 end
-
 
 local function addESP(part)
     if espObjects[part] then return end
@@ -36,6 +46,7 @@ local function addESP(part)
     box.ZIndex = 0
     box.Transparency = TRANSPARENCY
     box.Color = COLOR
+    -- parent to the part (this is fine for an adornment)
     box.Parent = part
 
     espObjects[part] = box
@@ -44,7 +55,9 @@ end
 local function removeESP(part)
     local box = espObjects[part]
     if box then
-        box:Destroy()
+        if box and box.Destroy then
+            box:Destroy()
+        end
         espObjects[part] = nil
     end
 end
@@ -63,7 +76,7 @@ scan()
 -- Catch newly added parts (small wait for replication)
 workspace.DescendantAdded:Connect(function(inst)
     if inst:IsA("BasePart") and isRespawnName(inst.Name) then
-        task.wait()
+        task.wait() -- small wait to ensure replication
         addESP(inst)
     end
 end)
