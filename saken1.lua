@@ -990,6 +990,175 @@ local function interruptActiveOverrides()
     end
 end
 
+-- Add these two config constants near the other constants at the top:
+local TURN_SPEED_REDUCTION = 0.30      -- 30% slower while recovering from a forced turn
+local TURN_PENALTY_DURATION = 0.5     -- how long (seconds) the penalty lasts
+
+-- internal helper: clear any active turn penalty and restore WalkSpeed
+local function clearTurnPenalty()
+    if controller._activeTurn then
+        local tinfo = controller._activeTurn
+        controller._activeTurn = nil
+        pcall(function()
+            if humanoid and tinfo.savedWalkSpeed then
+                humanoid.WalkSpeed = tinfo.savedWalkSpeed
+            end
+        end)
+        if tinfo.dieConn then
+            pcall(function() tinfo.dieConn:Disconnect() end)
+        end
+    end
+end
+
+-- Interrupt and cleanup any active overrides (dodge or face) and turn penalties
+local function interruptActiveOverrides()
+    -- active dodge cleanup
+    if controller._activeDodge then
+        local info = controller._activeDodge
+        controller._activeDodge = nil
+        pcall(function()
+            if info.bv and info.bv.Parent then
+                info.bv:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid then
+                humanoid.WalkSpeed = info.savedWalkSpeed or 16
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- active face cleanup
+    if controller._activeFace then
+        local info = controller._activeFace
+        controller._activeFace = nil
+        pcall(function()
+            if info.bg and info.bg.Parent then
+                info.bg:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.hbConn then info.hbConn:Disconnect() end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid and info.savedAutoRotate ~= nil then
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- clear any turn penalty (restores walk speed)
+    clearTurnPenalty()
+end
+
+-- TURN penalty config (keep near other config if already defined)
+local TURN_SPEED_REDUCTION = 0.30      -- 30% slower while recovering from a forced turn
+local TURN_PENALTY_DURATION = 0.5     -- how long (seconds) the penalty lasts
+
+-- Helper: locate SpeedMultipliers folder for the local killer entry
+local function getMySpeedMultipliersFolder()
+    local playersNode = workspace:FindFirstChild("Players")
+    if not playersNode then return nil end
+    local killersFolder = playersNode:FindFirstChild("Killers")
+    if not killersFolder then return nil end
+    local myEntry = killersFolder:FindFirstChild(LocalPlayer.Name)
+    if not myEntry then return nil end
+    local speedMultFolder = myEntry:FindFirstChild("SpeedMultipliers")
+    return speedMultFolder
+end
+
+-- Helper: apply directional multiplier penalty (stores original so we can restore)
+local function applyDirectionalPenalty(multipliedValue)
+    local folder = getMySpeedMultipliersFolder()
+    if not folder then return false end
+    local dirVal = folder:FindFirstChild("DirectionalMovement")
+    if not dirVal or not (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then return false end
+
+    -- store original so we can restore
+    local orig = dirVal.Value
+    -- set the reduced value
+    pcall(function() dirVal.Value = multipliedValue end)
+
+    -- store in controller state so interrupts/cleanup can restore
+    controller._activeTurn = controller._activeTurn or {}
+    -- disconnect any previous dieConn we replaced
+    if controller._activeTurn.dirDieConn then
+        pcall(function() controller._activeTurn.dirDieConn:Disconnect() end)
+    end
+    controller._activeTurn.dirVal = dirVal
+    controller._activeTurn.origDirectional = orig
+
+    return true
+end
+
+-- Helper: restore directional multiplier if we previously changed it
+local function restoreDirectionalPenalty()
+    if not controller._activeTurn then return end
+    local t = controller._activeTurn
+    controller._activeTurn = nil
+    if t and t.dirVal and t.dirVal.Parent then
+        pcall(function() t.dirVal.Value = t.origDirectional end)
+    end
+    if t and t.dirDieConn then
+        pcall(function() t.dirDieConn:Disconnect() end)
+    end
+end
+
+-- Interrupt and cleanup any active overrides (dodge or face) and turn penalties
+local function interruptActiveOverrides()
+    -- active dodge cleanup (unchanged behavior for BV)
+    if controller._activeDodge then
+        local info = controller._activeDodge
+        controller._activeDodge = nil
+        pcall(function()
+            if info.bv and info.bv.Parent then
+                info.bv:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid then
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- active face cleanup (unchanged orientation cleanup)
+    if controller._activeFace then
+        local info = controller._activeFace
+        controller._activeFace = nil
+        pcall(function()
+            if info.bg and info.bg.Parent then
+                info.bg:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.hbConn then info.hbConn:Disconnect() end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid and info.savedAutoRotate ~= nil then
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- restore any directional multiplier penalty we applied
+    restoreDirectionalPenalty()
+end
+
+-- Back dodge with BodyVelocity; after the dodge we apply a short directional penalty
 local function performBackDodgeOverride()
     if not isPlayingKiller() then return end
     if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
@@ -1004,10 +1173,12 @@ local function performBackDodgeOverride()
     local backHoriz = Vector3.new(back.X, 0, back.Z)
     if backHoriz.Magnitude < 0.001 then return end
     backHoriz = backHoriz.Unit
-    local savedWalkSpeed = humanoid.WalkSpeed
     local savedAutoRotate = humanoid.AutoRotate
+
+    -- disable autorotate and zero walk speed so BV carries motion externally
     humanoid.AutoRotate = false
     humanoid.WalkSpeed = 0
+
     local bv = Instance.new("BodyVelocity")
     bv.Name = "AutoReflexBackDodge"
     local maxForceHoriz
@@ -1027,6 +1198,7 @@ local function performBackDodgeOverride()
     bv.P = DODGE_FORCE_P
     bv.Velocity = Vector3.new(backHoriz.X * speed, preservedY, backHoriz.Z * speed)
     bv.Parent = hrp
+
     local dieConn
     dieConn = humanoid.Died:Connect(function()
         if bv and bv.Parent then
@@ -1036,37 +1208,64 @@ local function performBackDodgeOverride()
             pcall(function() dieConn:Disconnect() end)
         end
     end)
+
     controller._activeDodge = {
         bv = bv,
-        savedWalkSpeed = savedWalkSpeed,
         savedAutoRotate = savedAutoRotate,
         dieConn = dieConn
     }
+
     if ENABLE_AUTO_KILL_PREVIOUS then
         killPreviousController()
     end
+
+    -- after the dodge duration: destroy BV and apply directional penalty
     delay(DODGE_OVERRIDE_DURATION, function()
-        if not controller._activeDodge then
-            return
-        end
+        if not controller then return end
         local info = controller._activeDodge
         controller._activeDodge = nil
-        if info.bv and info.bv.Parent then
+        if info and info.bv and info.bv.Parent then
             pcall(function() info.bv:Destroy() end)
         end
-        if humanoid then
-            pcall(function()
-                humanoid.WalkSpeed = info.savedWalkSpeed or 16
-                humanoid.AutoRotate = info.savedAutoRotate
-            end)
+
+        -- Attempt to apply directional multiplier penalty based on current DirectionalMovement
+        local applied = false
+        local folder = getMySpeedMultipliersFolder()
+        if folder then
+            local dirVal = folder:FindFirstChild("DirectionalMovement")
+            if dirVal and (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then
+                local orig = dirVal.Value or 1
+                local newVal = math.max(0.01, orig * (1 - TURN_SPEED_REDUCTION))
+                applied = applyDirectionalPenalty(newVal)
+                -- register character death to restore if necessary
+                if applied and info and info.dieConn then
+                    -- store dieConn so restore can disconnect it on death
+                    controller._activeTurn.dirDieConn = info.dieConn
+                end
+                -- schedule full restore after the penalty duration
+                if applied then
+                    delay(TURN_PENALTY_DURATION, function()
+                        -- only restore if still the same penalty we applied
+                        if controller._activeTurn and controller._activeTurn.origDirectional == orig then
+                            restoreDirectionalPenalty()
+                        end
+                    end)
+                end
+            end
         end
-        if info.dieConn then
+
+        -- If we failed to apply via DirectionalMovement, fallback to restoring AutoRotate immediately
+        if not applied then
+            pcall(function() if humanoid then humanoid.AutoRotate = info and info.savedAutoRotate end end)
+        end
+
+        if info and info.dieConn then
             pcall(function() info.dieConn:Disconnect() end)
         end
     end)
 end
 
--- Face override: instant snap + heartbeat hold so ShiftLock can't fight it.
+-- Face override: snap to survivor, hold orientation, and apply directional penalty immediately
 local function performFaceOverride(survivor)
     if not isPlayingKiller() then return end
     if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
@@ -1081,6 +1280,22 @@ local function performFaceOverride(survivor)
     -- Save and disable AutoRotate
     local savedAutoRotate = humanoid.AutoRotate
     humanoid.AutoRotate = false
+
+    -- Attempt to apply a directional multiplier penalty immediately (based on current value)
+    local applied = false
+    local folder = getMySpeedMultipliersFolder()
+    if folder then
+        local dirVal = folder:FindFirstChild("DirectionalMovement")
+        if dirVal and (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then
+            local orig = dirVal.Value or 1
+            local newVal = math.max(0.01, orig * (1 - TURN_SPEED_REDUCTION))
+            applied = applyDirectionalPenalty(newVal)
+            -- register dieConn so we can restore on death
+            if applied and controller._activeTurn and controller._activeTurn.dirVal then
+                -- we'll reuse the face dieConn below to disconnect
+            end
+        end
+    end
 
     -- Compute look CFrame (preserve hrp Y for level look)
     local lookPos = Vector3.new(sPos.X, hrp.Position.Y, sPos.Z)
@@ -1103,7 +1318,7 @@ local function performFaceOverride(survivor)
     bg.CFrame = targetCFrame
     bg.Parent = hrp
 
-    -- Heartbeat forcing to hold exact orientation (does NOT track survivor movement)
+    -- Heartbeat forcing to hold exact orientation
     local hbConn
     hbConn = RunService.Heartbeat:Connect(function()
         if not controller._activeFace then
@@ -1128,6 +1343,8 @@ local function performFaceOverride(survivor)
         if dieConn then
             pcall(function() dieConn:Disconnect() end)
         end
+        -- restore directional multiplier on death
+        restoreDirectionalPenalty()
     end)
 
     controller._activeFace = {
@@ -1136,6 +1353,11 @@ local function performFaceOverride(survivor)
         savedAutoRotate = savedAutoRotate,
         dieConn = dieConn
     }
+
+    -- If we applied a directional penalty, attach dieConn reference so it gets restored on death
+    if controller._activeTurn and controller._activeTurn.dirVal then
+        controller._activeTurn.dirDieConn = dieConn
+    end
 
     if ENABLE_AUTO_KILL_PREVIOUS then
         killPreviousController()
@@ -1157,8 +1379,23 @@ local function performFaceOverride(survivor)
         if info.dieConn then
             pcall(function() info.dieConn:Disconnect() end)
         end
+
+        -- schedule restore of the directional multiplier (if we changed it)
+        if controller._activeTurn and controller._activeTurn.origDirectional then
+            local orig = controller._activeTurn.origDirectional
+            delay(TURN_PENALTY_DURATION, function()
+                if controller._activeTurn and controller._activeTurn.origDirectional == orig then
+                    restoreDirectionalPenalty()
+                end
+            end)
+        else
+            -- nothing to restore via directional multiplier
+            restoreDirectionalPenalty()
+        end
     end)
 end
+
+
 
 local function onResistanceValueChanged(resVal)
     if not resVal then return end
