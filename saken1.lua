@@ -773,7 +773,7 @@ local DODGE_FORCE_MAX = Vector3.new(1e5, 1e5, 1e5)
 local DODGE_MAX_SPEED = 19
 
 -- Face duration (0.5s requested)
-local FACE_OVERRIDE_DURATION = 0.4
+local FACE_OVERRIDE_DURATION = 0.5
 
 local ENABLE_AUTO_KILL_PREVIOUS = true
 local KILL_HOTKEY = Enum.KeyCode.K
@@ -992,7 +992,7 @@ end
 
 -- Add these two config constants near the other constants at the top:
 local TURN_SPEED_REDUCTION = 0.30      -- 30% slower while recovering from a forced turn
-local TURN_PENALTY_DURATION = 0.4     -- how long (seconds) the penalty lasts
+local TURN_PENALTY_DURATION = 0.5     -- how long (seconds) the penalty lasts
 
 -- internal helper: clear any active turn penalty and restore WalkSpeed
 local function clearTurnPenalty()
