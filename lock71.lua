@@ -1,3 +1,4 @@
+
 -- Aim Assist — Post-windup only recording (FULL-FILE) — LAST-DIRECTION + FIXED LATERAL
 -- Updated: ignore trivial pushes removed; robust direction detection, logging + hysteresis + temporary immediate trend + regression ensemble for short windows
 
@@ -139,12 +140,77 @@ local EWMA_ALPHA = 0.25
 local PRE_RECORD_WINDOW = 0.18
 local VEL_DIR_THRESHOLD = 0.6
 
+-- Minimum absolute lateral dodge (studs) required for a post‑windup recording
+-- to be considered significant.  Dodges smaller than this value are more
+-- likely to be noise (e.g. bumping into walls or jittery movement) and will
+-- not count towards adaptation.  Tune this value based on typical player
+-- sidestep distances; values too small may trigger adaptation on random
+-- jitter, whereas values too large may miss intentional micro‑dodges.
+local MIN_DODGE_PEAK_FOR_COUNT = 0.3
+
+-- Scale the adaptation lateral offset by the distance to the target.  When
+-- a target is far away, a fixed lateral offset (e.g. ±4.5 studs) may be
+-- insufficient because the forward lead is large and the lateral shift is
+-- relatively small.  The factor used is (1 + distance * LATERAL_DISTANCE_SCALE).
+-- For example, with a distance of 30 studs and LATERAL_DISTANCE_SCALE = 0.03,
+-- the offset multiplier becomes 1 + 0.9 = 1.9, producing roughly twice the
+-- lateral shift.  Tune this value based on in‑game testing.
+local LATERAL_DISTANCE_SCALE = 0.03
+
 -- NEW: robust detection tuning (tuned for shorter dodges)
 local MIN_MOVE_MAG = 0.4                -- baseline minimum absolute raw window movement to count (studs) (kept for reference but not used for gating)
 local DIR_THRESHOLD = 0.5
 local SMALL_DELTA_THRESHOLD = 0.12      -- per-sample delta threshold for sign voting
 local HYSTERESIS_REQUIRED = 2
 local STALE_TREND_TIMEOUT = 4.0         -- seconds after which an old trend expires if nothing new
+
+-- Minimum number of total post‑windup trials (across E and Q) required before
+-- a stable trend is considered valid.  Without enough historical data the
+-- algorithm may latch onto a direction too early (for example after only
+-- one or two dodges), which can cause premature adaptation.  Increasing
+-- this value delays the point at which a permanent left/right trend is set
+-- in `profAll.lastTrend`, thereby preventing adaptation from engaging
+-- before the target’s dodging behaviour has been sufficiently observed.
+local MIN_TRIALS_FOR_TREND = 4
+
+-- NEW: height difference threshold.  If the shooter and target are on
+-- different vertical levels (for example when fighting on different floors),
+-- post‑windup trials that miss should not be treated as dodges.  When the
+-- absolute difference in Y‑coordinate between the shooter and target
+-- exceeds this threshold and the shot misses, the trial will be ignored
+-- (not counted, no adaptation update).  Tune this based on your map
+-- vertical spacing; a value of 7 studs is used here to better tolerate
+-- mild elevation differences while still filtering out large height gaps.
+local VERTICAL_HEIGHT_THRESHOLD = 7
+
+-- NEW: list of animation IDs that indicate the player is sprinting.  When
+-- one of these animations plays we mark the player as running and allow
+-- the normal velocity sampling to update `runSpeed`.  We do not set
+-- `runSpeed` to a fixed value here because a player's speed may change
+-- due to hits or speed boosts.  The IDs below were supplied by the
+-- game developer; update or extend this list to match any additional
+-- running animations in your game.
+local RUN_ANIMATION_IDS = {
+    ["136252471123500"] = true,
+    ["115946474977409"] = true,
+    ["71505511479171"]  = true,
+    ["125869734469543"] = true,
+    ["117058860640843"] = true,
+    ["133312964070618"] = true,
+    ["99159420513149"]  = true,
+    ["120313643102609"] = true,
+    ["86557953969836"]  = true,
+    ["120715084586730"] = true,
+    ["101438873382721"] = true,
+}
+
+-- NEW: speed threshold to detect a player stuck against an obstacle while
+-- running.  When a run animation is active but the measured velocity is
+-- below this value (studs per second), the player is likely dragging on a
+-- wall.  In this case the prediction should not apply forward lead; the
+-- aim will be directed to the target's current position instead.  Tune
+-- based on typical run speeds in your game.
+local STUCK_SPEED_THRESHOLD = 3.0
 
 -- NEW: temporary/immediate trend tuning (helps very short post-record windows)
 local IMMEDIATE_TREND_MIN_PEAK = 0.9     -- peak (studs) required to instantly apply a temporary trend
@@ -382,6 +448,8 @@ local function startPostWindupRecording(targetChar, key)
         Q = {history = {}, trials = 0, hits = 0},
         allHistory = {},
         runSpeed = 25,
+        consecutiveDodges = 0,
+        isRunning = false,
         lastCast = nil,
         isCasting = false,
         ewmaDelta = nil,
@@ -588,10 +656,35 @@ local function startPostWindupRecording(targetChar, key)
             end
 
             -- determine if this should *count* as a dodge
-            -- MINIMUM-MOVE GATING REMOVED: any non-zero finalDecision counts now
+            -- Only count when a direction was decided AND the absolute peak
+            -- lateral delta exceeds a minimum threshold.  This prevents
+            -- spurious tiny movements (for example, sliding against a wall)
+            -- from polluting the adaptation history.
             local counted = false
-            if finalDecision ~= 0 then
+            if finalDecision ~= 0 and math.abs(peakDelta) >= MIN_DODGE_PEAK_FOR_COUNT then
                 counted = true
+            end
+
+            -- vertical difference gating: if the shot missed and the target is on a very
+            -- different vertical level from the shooter, do not count this trial.  This
+            -- prevents adaptation from reacting to misses caused by height differences
+            -- rather than dodging.  We assume shooterPos was captured at the start of
+            -- the post‑windup window.
+            if counted and not hitDetected then
+                local verticalDiff = nil
+                pcall(function()
+                    local shooterY = nil
+                    -- prefer shooterPos captured outside; fallback to current shooter HRP
+                    if shooterPos then shooterY = shooterPos.Y end
+                    local curShooter = LocalPlayer and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or nil
+                    if not shooterY and curShooter then shooterY = curShooter.Position.Y end
+                    if shooterY and hrp and hrp.Position then
+                        verticalDiff = math.abs(shooterY - hrp.Position.Y)
+                    end
+                end)
+                if verticalDiff and verticalDiff >= VERTICAL_HEIGHT_THRESHOLD then
+                    counted = false
+                end
             end
 
             -- Hysteresis: update stored lastTrend only when counts agree for consecutive recorded detections
@@ -616,8 +709,18 @@ local function startPostWindupRecording(targetChar, key)
                     profAll.trendStableCount = 1
                 end
                 if profAll.trendStableCount >= HYSTERESIS_REQUIRED then
-                    profAll.lastTrend = newTrendName
-                    profAll.lastTrendTime = tick()
+                    -- Only accept a stable trend when the target has dodged
+                    -- consecutively at least twice OR when enough trials have
+                    -- accumulated across E and Q.  This prevents premature
+                    -- adaptation for players who get hit consistently.
+                    local ok, totalTrials = pcall(function()
+                        return ((profAll.E and profAll.E.trials) or 0) + ((profAll.Q and profAll.Q.trials) or 0)
+                    end)
+                    if not ok then totalTrials = 0 end
+                    if (profAll.consecutiveDodges or 0) >= 2 or (totalTrials >= MIN_TRIALS_FOR_TREND) then
+                        profAll.lastTrend = newTrendName
+                        profAll.lastTrendTime = tick()
+                    end
                 end
             else
                 profAll.trendStableCount = 0
@@ -631,6 +734,20 @@ local function startPostWindupRecording(targetChar, key)
             if profAll.temporaryTrend and profAll.temporaryTrendExpiry and tick() > profAll.temporaryTrendExpiry then
                 profAll.temporaryTrend = nil
                 profAll.temporaryTrendExpiry = nil
+            end
+
+            -- update consecutive dodge counter.  If this trial was counted and a
+            -- direction (Left or Right) was decided and the shot did not hit
+            -- the target, increment the consecutive dodge count.  Otherwise
+            -- reset the counter.  This ensures that adaptation will only be
+            -- enabled after a player has dodged multiple times in a row.  A
+            -- miss caused by dodging increments the count; a hit resets it.
+            do
+                if counted and finalDecision ~= 0 and not hitDetected then
+                    profAll.consecutiveDodges = (profAll.consecutiveDodges or 0) + 1
+                else
+                    profAll.consecutiveDodges = 0
+                end
             end
 
             -- record history only if counted
@@ -757,10 +874,39 @@ local function computeAdaptDecisionForPlayer(pl)
     end
     local sameOK, sameTrend = lastNSame(ADAPT_EARLY_SAME)
 
+    -- Detect quick alternating dodges (e.g. left then right) which should
+    -- disable adaptation.  Look at the most recent few trials and see if the
+    -- last two non‑"None" trends differ.  If so, we consider the player to
+    -- be zig‑zagging unpredictably and refrain from adapting.
+    local patternAlternate = false
+    do
+        local found1, trend1, found2, trend2 = false, nil, false, nil
+        for i = 1, math.min(#history, 3) do
+            local t = history[i]
+            if t and t.trend and t.trend ~= "None" then
+                if not found1 then
+                    found1 = true; trend1 = t.trend
+                elseif not found2 then
+                    found2 = true; trend2 = t.trend
+                    break
+                end
+            end
+        end
+        if found1 and found2 and trend1 ~= trend2 then
+            patternAlternate = true
+        end
+    end
+
+    -- Determine whether adaptation should be enabled.  Require at least two
+    -- consecutive dodges and no alternating zig‑zag pattern.  This ensures
+    -- adaptation is only applied when the target consistently dodges in
+    -- one direction and has not recently switched sides.
     local adapt = false
-    if totalTrials >= ADAPT_MIN_TRIALS then adapt = true end
-    if sameOK then adapt = true end
-    if math.abs(avgDelta) >= ADAPT_MIN_AVG_DELTA and totalTrials >= 3 then adapt = true end
+    if not patternAlternate then
+        if (profAll.consecutiveDodges or 0) >= 2 then
+            adapt = true
+        end
+    end
 
     return {
         adapt = adapt,
@@ -813,6 +959,23 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
     local relPos = center - myPos
     local distance = relPos.Magnitude
     local targetSpeed = vel.Magnitude
+
+    -- Early detection of a stuck running player.  If the player is running
+    -- (based on animation state) but their velocity is below a small
+    -- threshold, they are likely dragging against a wall or obstacle.
+    -- In this situation we bypass prediction entirely and aim directly
+    -- at the target's current center.  We compute the player profile here
+    -- to access the `isRunning` flag without waiting for later logic.
+    do
+        local ownerEarly = Players:GetPlayerFromCharacter(targetChar)
+        if ownerEarly then
+            local profEarly = targetProfiles[ownerEarly.UserId]
+            if profEarly and profEarly.isRunning and targetSpeed <= STUCK_SPEED_THRESHOLD then
+                return center
+            end
+        end
+    end
+
 
     -- compute rightDir early so we can apply lateral after blending
     local tHRP = targetChar:FindFirstChild("HumanoidRootPart")
@@ -877,83 +1040,195 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
     local profAll = owner and targetProfiles[owner.UserId] or nil
     local adaptInfo = owner and computeAdaptDecisionForPlayer(owner) or nil
 
-    -- adaptAllowed if caller asked OR if we already have a learned trend (apply FIXED_LATERAL outside windup)
+    -- Track the predominant lateral movement direction during the windup for Q.
+    -- Many players will run in one direction during the windup and then dodge
+    -- in the opposite direction just before release.  We accumulate the sign
+    -- of the lateral velocity (dot with rightDir) for Q casts so that we can
+    -- infer this pattern.  We only store significant movement (beyond a small
+    -- threshold) and reset the accumulator when the player is not charging Q.
+    if profAll then
+        if chargeKey and chargeKey == Enum.KeyCode.Q then
+            local sign = 0
+            local dotLR = lateralVel:Dot(rightDir)
+            if dotLR > 0.05 then
+                sign = 1
+            elseif dotLR < -0.05 then
+                sign = -1
+            end
+            profAll.preWindupDirSumQ = (profAll.preWindupDirSumQ or 0) + sign
+            -- Only count frames where movement was significant
+            if sign ~= 0 then
+                profAll.preWindupDirCountQ = (profAll.preWindupDirCountQ or 0) + 1
+            end
+        else
+            -- Clear prewindup memory when not in Q windup
+            if profAll.preWindupDirSumQ or profAll.preWindupDirCountQ then
+                profAll.preWindupDirSumQ = nil
+                profAll.preWindupDirCountQ = nil
+            end
+        end
+    end
+
+    -- Determine whether adaptation logic should be allowed for this shot.
+    -- Historically, the script allowed adaptation whenever a lastTrend or
+    -- temporaryTrend existed.  This meant adaptation could kick in after
+    -- only a couple of recorded dodges, which often led to mis‑aimed shots.
+    -- Here we remove direct dependence on lastTrend and instead rely on
+    -- `computeAdaptDecisionForPlayer` to signal when enough evidence has
+    -- accumulated (e.g. after MIN_TRIALS_FOR_TREND trials) to justify
+    -- adaptation.  forceSnap and allowAdapt still override this decision.
     local adaptAllowed = false
-    if forceSnap then adaptAllowed = true end
-    if allowAdapt then adaptAllowed = true end
-    if profAll and (profAll.lastTrend or profAll.temporaryTrend) then adaptAllowed = true end
+    if forceSnap or allowAdapt then
+        adaptAllowed = true
+    else
+        adaptAllowed = false
+    end
 
     if targetSpeed < 0.01 and not adaptAllowed then
         return center
     end
 
+    -- Determine if we have enough dodges to activate adaptation.  We require
+    -- at least two consecutive dodges before considering lastTrend or
+    -- temporaryTrend.  Without this gate, adaptation can kick in as soon as
+    -- a temporary trend is set, leading to premature left/right offsets.
+    local enoughDodges = false
+    if profAll and (profAll.consecutiveDodges or 0) >= 2 then
+        enoughDodges = true
+    end
+
+    -- Determine the predominant pre‑windup direction for Q casts.  If the
+    -- player has been moving predominantly in one direction during the
+    -- windup (based on accumulated lateral velocity signs), we anticipate
+    -- that they may dodge in the opposite direction.  We use this when
+    -- adaptation has not yet engaged (not enough dodges) and only during
+    -- Q windups.
+    local dominantPreDir = nil
+    if profAll and profAll.preWindupDirCountQ and profAll.preWindupDirCountQ >= 3 then
+        local total = profAll.preWindupDirCountQ
+        local sum = profAll.preWindupDirSumQ or 0
+        if math.abs(sum) >= 0.6 * total then
+            dominantPreDir = (sum > 0) and 1 or -1
+        end
+    end
+
     -- compute lateralApplied but DO NOT add it to predicted until after blending
+    -- When adaptAllowed is true, we consider three cases:
+    --   1. Enough dodges: use temporaryTrend or lastTrend (or computed lateral) as before.
+    --   2. Not enough dodges but Q windup with a dominant pre‑windup run direction: aim opposite.
+    --   3. Otherwise, do not apply adaptation and use a small velocity nudge.
     local lateralApplied = 0
     if adaptAllowed and profAll then
-        -- Use temporary high-confidence trend first (if still valid), then lastTrend, then fallback
-        if profAll.temporaryTrend and profAll.temporaryTrendExpiry and tick() <= profAll.temporaryTrendExpiry then
-            if profAll.temporaryTrend == "Right" then lateralApplied = FIXED_LATERAL
-            elseif profAll.temporaryTrend == "Left" then lateralApplied = -FIXED_LATERAL end
-            if owner then warn(("[AimAssist] USING TEMP TREND uid=%d trend=%s expiry=%.2f"):format(owner.UserId, profAll.temporaryTrend, profAll.temporaryTrendExpiry)) end
-        elseif profAll.lastTrend == "Right" then
-            lateralApplied = FIXED_LATERAL
-        elseif profAll.lastTrend == "Left" then
-            lateralApplied = -FIXED_LATERAL
-        else
-            -- fallback: if historical adaptation flagged true, use computed lateral; otherwise use no lateral
-            if adaptInfo and adaptInfo.adapt then
-                local runSpeed = (profAll and profAll.runSpeed) or math.max(targetSpeed,6)
-                lateralApplied = computeLateralStuds(adaptInfo, runSpeed, distance, t)
+        if enoughDodges then
+            if profAll.temporaryTrend and profAll.temporaryTrendExpiry and tick() <= profAll.temporaryTrendExpiry then
+                if profAll.temporaryTrend == "Right" then
+                    lateralApplied = FIXED_LATERAL
+                elseif profAll.temporaryTrend == "Left" then
+                    lateralApplied = -FIXED_LATERAL
+                end
+                if owner then
+                    warn(("[AimAssist] USING TEMP TREND uid=%d trend=%s expiry=%.2f"):format(owner.UserId, profAll.temporaryTrend, profAll.temporaryTrendExpiry))
+                end
+            elseif profAll.lastTrend == "Right" then
+                lateralApplied = FIXED_LATERAL
+            elseif profAll.lastTrend == "Left" then
+                lateralApplied = -FIXED_LATERAL
+            else
+                -- fallback: if adaptation decision is true, use computed lateral
+                if adaptInfo and adaptInfo.adapt then
+                    local runSpeed = (profAll and profAll.runSpeed) or math.max(targetSpeed,6)
+                    lateralApplied = computeLateralStuds(adaptInfo, runSpeed, distance, t)
+                end
             end
+        elseif chargeKey and chargeKey == Enum.KeyCode.Q and dominantPreDir then
+            -- Not enough dodges yet; anticipate an opposite dodge based on
+            -- pre‑windup movement.  If the player ran to the right (dominant
+            -- positive), we aim left, and vice versa.
+            lateralApplied = -dominantPreDir * FIXED_LATERAL
+            if owner then
+                warn(("[AimAssist] PREWINDUP Q PATTERN uid=%d dominantDir=%s applied lateral=%.2f"):format(owner.UserId, tostring(dominantPreDir), lateralApplied))
+            end
+        else
+            -- non-adapt path: keep the small lateral velocity nudge (this is small by design)
+            predicted = predicted + lateralVel * lateralBoost * s
         end
     else
-        -- non-adapt path: keep the small lateral velocity nudge (this is small by design)
+        -- adapt not allowed: apply small lateral nudge as before
         predicted = predicted + lateralVel * lateralBoost * s
     end
 
+    -- Apply windup opposite logic: invert lateralApplied during the early part of a windup.
+    -- This modification is applied before scaling so that the sign is taken into account.
+
+    -- Precompute a scale factor for the lateral offset.  When adaptation is
+    -- allowed this scales the lateral shift by distance to compensate for
+    -- large forward leads.  Otherwise the factor is 1 (no scaling).
+    local scaleFactor = 1
+    if adaptAllowed then
+        scaleFactor = 1 + distance * LATERAL_DISTANCE_SCALE
+    end
+
     -- windup opposite-then-snap logic (based on your charge/windup)
-    if chargeKey and profAll and (profAll.lastTrend or profAll.temporaryTrend or (adaptInfo and adaptInfo.adapt)) then
+    if chargeKey and profAll and adaptAllowed and (profAll.lastTrend or profAll.temporaryTrend or (adaptInfo and adaptInfo.adapt) or dominantPreDir) then
         local timeLeft = (chargeExpires or 0) - tick()
         -- If we are still early in the windup, aim to the OPPOSITE side to 'surprise' the target.
         if timeLeft > PRE_SNAP_TIME then
+            -- Early in the windup: invert the lateral offset to "trick" the
+            -- opponent.  Do not apply the offset yet; scaling will be
+            -- computed when the offset is actually applied.
             if math.abs(lateralApplied) > 0 then
                 lateralApplied = -lateralApplied
-                if owner then warn(("[AimAssist] WINDUP OPPOSITE uid=%d lateral=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft)) end
+                if owner then
+                    warn(("[AimAssist] WINDUP OPPOSITE uid=%d lateralRaw=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft))
+                end
             else
-                -- if we computed zero lateral but have historical adapt, try small computed lateral flip
+                -- if we computed zero lateral but have historical adapt, try
+                -- small computed lateral flip
                 if adaptInfo and adaptInfo.adapt then
                     local runSpeed = (profAll and profAll.runSpeed) or math.max(targetSpeed,6)
                     local comp = computeLateralStuds(adaptInfo, runSpeed, distance, t)
                     if math.abs(comp) > 0 then
                         lateralApplied = -comp
-                        if owner then warn(("[AimAssist] WINDUP OPPOSITE fallback uid=%d comp=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft)) end
+                        if owner then
+                            warn(("[AimAssist] WINDUP OPPOSITE fallback uid=%d comp=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft))
+                        end
                     end
                 end
             end
         else
-            -- within PRE_SNAP_TIME: force-snap to the predicted side (apply lateral immediately and return)
+            -- within PRE_SNAP_TIME: force-snap to the predicted side and
+            -- apply the lateral offset immediately with scaling.  Since
+            -- pre-snap occurs near the end of the windup, we apply the
+            -- computed lateralApplied (which may have been inverted) scaled by
+            -- the distance factor.
             if math.abs(lateralApplied) > 0 then
-                predicted = predicted + rightDir * lateralApplied
-                if owner then warn(("[AimAssist] WINDUP SNAP uid=%d lateral=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft)) end
+                predicted = predicted + rightDir * (lateralApplied * scaleFactor)
+                if owner then
+                    warn(("[AimAssist] WINDUP SNAP uid=%d lateral=%.2f (scaled=%.2f) timeLeft=%.3f"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), timeLeft))
+                end
             end
             return predicted
         end
     end
 
     if forceSnap then
-        -- apply lateral immediately for snap
-        if math.abs(lateralApplied) > 0 then predicted = predicted + rightDir * lateralApplied end
+        -- apply lateral immediately for snap.  Use scaled lateral if adaptation
+        -- is allowed, otherwise apply the raw lateral offset.
+        if math.abs(lateralApplied) > 0 then
+            predicted = predicted + rightDir * (lateralApplied * scaleFactor)
+        end
         return predicted
     end
 
     -- forward blending (keep as before)
     local blended = center:Lerp(predicted, math.clamp(s,0.1,1.0))
 
-    -- **apply the FIXED lateral AFTER blending** so it isn't averaged away
+    -- **apply the lateral AFTER blending** so it isn't averaged away.  Use
+    -- scaleFactor to enlarge the offset at longer distances.
     if math.abs(lateralApplied) > 0 then
-        blended = blended + rightDir * lateralApplied
+        blended = blended + rightDir * (lateralApplied * scaleFactor)
         if owner then
-            warn(("[AimAssist] ADAPT APPLY uid=%d lateral=%.2f lastTrend=%s"):format(owner.UserId, lateralApplied, (profAll.lastTrend or "nil")) )
+            warn(("[AimAssist] ADAPT APPLY uid=%d lateral=%.2f scaled=%.2f lastTrend=%s"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), (profAll.lastTrend or "nil")))
         end
     end
 
@@ -977,6 +1252,32 @@ local function onCharacterAnimationPlayed(character)
         if not track or not track.Animation then return end
         local animId = extractAnimId(track.Animation.AnimationId)
         if not animId then return end
+        -- detect running animations.  When the target plays a running animation
+        -- (sprint), update their runSpeed to the maximum sprint speed and do
+        -- not treat this as a cast event.  This prevents the post‑windup
+        -- recording logic from erroneously interpreting running as a dodge
+        -- and instead simply updates the internal speed estimate.
+        if RUN_ANIMATION_IDS[animId] then
+            local owner = Players:GetPlayerFromCharacter(character)
+            if owner then
+                targetProfiles[owner.UserId] = targetProfiles[owner.UserId] or {
+                    E = {history = {}, trials = 0, hits = 0},
+                    Q = {history = {}, trials = 0, hits = 0},
+                    allHistory = {},
+                    runSpeed = 25,
+                    consecutiveDodges = 0,
+                    lastCast = nil,
+                    isCasting = false,
+                    ewmaDelta = nil,
+                    lastTrend = nil,
+                    temporaryTrend = nil,
+                    temporaryTrendExpiry = nil
+                }
+                -- We no longer set isRunning here; running state is tracked
+                -- each frame in monitorAnimationStates.
+            end
+            return
+        end
         local key = animationToKey[animId]
         if not key then return end
 
@@ -992,7 +1293,20 @@ local function onCharacterAnimationPlayed(character)
             duration = (key == "E") and 0.75 or 1.7
         end
 
-        targetProfiles[owner.UserId] = targetProfiles[owner.UserId] or { E = {history = {}, trials = 0, hits = 0}, Q = {history = {}, trials = 0, hits = 0}, allHistory = {}, runSpeed = 25, lastCast = nil, isCasting = false, ewmaDelta = nil, lastTrend = nil, temporaryTrend = nil, temporaryTrendExpiry = nil }
+        targetProfiles[owner.UserId] = targetProfiles[owner.UserId] or {
+            E = {history = {}, trials = 0, hits = 0},
+            Q = {history = {}, trials = 0, hits = 0},
+            allHistory = {},
+            runSpeed = 25,
+            consecutiveDodges = 0,
+            isRunning = false,
+            lastCast = nil,
+            isCasting = false,
+            ewmaDelta = nil,
+            lastTrend = nil,
+            temporaryTrend = nil,
+            temporaryTrendExpiry = nil
+        }
         local profAll = targetProfiles[owner.UserId]
         profAll.lastCast = { key = key, t = tick(), expires = tick() + duration + PRE_RELEASE_MARGIN }
         profAll.isCasting = true
@@ -1038,23 +1352,45 @@ local function monitorAnimationStates()
             if hum then
                 local playing = hum:GetPlayingAnimationTracks()
                 local found = false
+                -- ensure the profile exists and reset running flag for this tick
+                targetProfiles[pl.UserId] = targetProfiles[pl.UserId] or {
+                    E = {history = {}, trials = 0, hits = 0},
+                    Q = {history = {}, trials = 0, hits = 0},
+                    allHistory = {},
+                    runSpeed = 25,
+                    consecutiveDodges = 0,
+                    isRunning = false,
+                    lastCast = nil,
+                    isCasting = false,
+                    ewmaDelta = nil,
+                    lastTrend = nil,
+                    temporaryTrend = nil,
+                    temporaryTrendExpiry = nil
+                }
+                local prof = targetProfiles[pl.UserId]
+                prof.isRunning = false
                 for _, track in ipairs(playing) do
                     local ok, animId = pcall(function() return extractAnimId(track.Animation and track.Animation.AnimationId) end)
-                    if ok and animId and animationToKey[animId] then
-                        found = true
-                        local key = animationToKey[animId]
-                        targetProfiles[pl.UserId] = targetProfiles[pl.UserId] or { E = {history = {}, trials = 0, hits = 0}, Q = {history = {}, trials = 0, hits = 0}, allHistory = {}, runSpeed = 25, lastCast = nil, isCasting = false, ewmaDelta = nil, lastTrend = nil, temporaryTrend = nil, temporaryTrendExpiry = nil }
-                        local prof = targetProfiles[pl.UserId]
-                        local duration = nil
-                        pcall(function() duration = track.Length end)
-                        if not duration then duration = (key == "E") and 0.75 or 1.7 end
-                        prof.lastCast = { key = key, t = tick(), expires = tick() + duration + PRE_RELEASE_MARGIN }
-                        prof.isCasting = true
-                        break
+                    if ok and animId then
+                        -- mark running state
+                        if RUN_ANIMATION_IDS[animId] then
+                            prof.isRunning = true
+                        end
+                        -- handle cast animations (E/Q)
+                        if animationToKey[animId] then
+                            found = true
+                            local key = animationToKey[animId]
+                            local duration = nil
+                            pcall(function() duration = track.Length end)
+                            if not duration then duration = (key == "E") and 0.75 or 1.7 end
+                            prof.lastCast = { key = key, t = tick(), expires = tick() + duration + PRE_RELEASE_MARGIN }
+                            prof.isCasting = true
+                            break
+                        end
                     end
                 end
-                if not found and targetProfiles[pl.UserId] then
-                    local prof = targetProfiles[pl.UserId]
+                if not found then
+                    -- no cast animation found; update casting and lastCast based on expiry
                     if prof.lastCast and prof.lastCast.expires and tick() <= prof.lastCast.expires then
                         prof.isCasting = true
                     else
@@ -1138,7 +1474,16 @@ local function buildTargetInfoText(targetChar)
     local pl = Players:GetPlayerFromCharacter(targetChar)
     if not pl then return "" end
     local uid = pl.UserId
-    local prof = targetProfiles[uid] or { E = {trials=0,hits=0}, Q = {trials=0,hits=0}, runSpeed = 25, lastCast = nil, isCasting = false, ewmaDelta = nil, lastTrend = nil }
+    local prof = targetProfiles[uid] or {
+        E = {trials=0,hits=0},
+        Q = {trials=0,hits=0},
+        runSpeed = 25,
+        consecutiveDodges = 0,
+        lastCast = nil,
+        isCasting = false,
+        ewmaDelta = nil,
+        lastTrend = nil
+    }
     local eT = prof.E.trials or 0; local qT = prof.Q.trials or 0
     local eH = prof.E.hits or 0; local qH = prof.Q.hits or 0
     local lastCast = prof.lastCast and (prof.lastCast.key .. "@" .. tostring(math.floor((tick()-prof.lastCast.t)*100)/100) .. "s") or "none"
