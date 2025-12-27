@@ -10,6 +10,7 @@
 --   • If your editor shows fewer than ~1,500 lines after pasting, fetch the
 --     file again instead of running the truncated version; incomplete copies
 --     will break the aim logic.
+--   • For step-by-step approval or deployment guidance, see `APPLYING_CHANGES.md`.
 
 local function disconnectList(list)
     if not list then return end
