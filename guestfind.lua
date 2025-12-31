@@ -1,5 +1,6 @@
 -- LocalScript (StarterPlayer > StarterPlayerScripts)
 -- Multi-Guest turn away + slowdown stun, with BIGGER + LOWER "STUNNED" box
+-- NEW: if only ONE guest is triggering, turn random left/right by 80 degrees.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -20,6 +21,9 @@ local MIN_SPRINT_MULT_FACTOR = 0.35
 local APPLY_SLOW_EVERY_FRAME = true
 
 local TURN_LERP_ALPHA = 0.55
+
+-- NEW: single-guest turn behavior
+local SINGLE_GUEST_TURN_DEGREES = 80
 
 -- UI tuning (NEW)
 local STUN_BOX_SIZE = UDim2.new(0, 520, 0, 150)  -- bigger
@@ -52,6 +56,9 @@ local ctrl = {
 	box = nil,
 
 	lastEscapeDir = nil,
+
+	-- NEW: chosen direction for single-guest turn during a stun
+	turnSign = 1, -- +1 right, -1 left
 }
 
 _G.GuestRadiusWalkStun = ctrl
@@ -232,8 +239,9 @@ local function setStunUi(on)
 end
 
 --========================
--- TURN AWAY FROM ALL GUESTS
+-- TURNING
 --========================
+-- multi-guest escape direction
 local function computeEscapeDir(myPos, guestParts)
 	if #guestParts == 0 then return nil end
 	local sum = Vector3.zero
@@ -252,6 +260,29 @@ local function computeEscapeDir(myPos, guestParts)
 	return sum.Unit
 end
 
+-- single-guest: rotate direction-to-guest by +/- degrees
+local function faceTurned(myHRP, guestPart, sign, degrees)
+	if not myHRP or not guestPart then return end
+
+	local myPos = myHRP.Position
+	local gPos = guestPart.Position
+	local toGuest = Vector3.new(gPos.X - myPos.X, 0, gPos.Z - myPos.Z)
+	if toGuest.Magnitude < 1e-3 then return end
+	toGuest = toGuest.Unit
+
+	local rad = math.rad(degrees) * sign
+	local cosr, sinr = math.cos(rad), math.sin(rad)
+
+	local x = toGuest.X * cosr - toGuest.Z * sinr
+	local z = toGuest.X * sinr + toGuest.Z * cosr
+	local dir = Vector3.new(x, 0, z)
+	if dir.Magnitude < 1e-3 then return end
+	dir = dir.Unit
+
+	myHRP.CFrame = CFrame.new(myPos, myPos + dir)
+end
+
+-- multi-guest: face a direction with smoothing
 local function faceDir(myHRP, dir)
 	if not myHRP or not dir then return end
 	local pos = myHRP.Position
@@ -289,6 +320,9 @@ local function applySlow(hum, hrp)
 end
 
 local function startStun(hum)
+	-- NEW: pick a random turn direction for single-guest mode
+	ctrl.turnSign = (math.random(0, 1) == 0) and -1 or 1
+
 	ctrl.stunWasKiller = isLocalKiller(hum)
 	ctrl.stunUntil = math.max(ctrl.stunUntil, os.clock() + STUN_SECONDS)
 	ctrl.lastEscapeDir = nil
@@ -351,11 +385,18 @@ connect(RunService.Heartbeat, function()
 			applySlow(hum, myHRP)
 		end
 
-		local dir = computeEscapeDir(myHRP.Position, guestParts)
-		if not dir then
-			dir = ctrl.lastEscapeDir or Vector3.new(myHRP.CFrame.LookVector.X, 0, myHRP.CFrame.LookVector.Z).Unit
+		-- TURN LOGIC:
+		if #guestParts == 1 then
+			-- single guest: turn left/right randomly by 80 degrees
+			faceTurned(myHRP, guestParts[1], ctrl.turnSign, SINGLE_GUEST_TURN_DEGREES)
+		else
+			-- multiple guests: escape direction (no weird overlap)
+			local dir = computeEscapeDir(myHRP.Position, guestParts)
+			if not dir then
+				dir = ctrl.lastEscapeDir or Vector3.new(myHRP.CFrame.LookVector.X, 0, myHRP.CFrame.LookVector.Z).Unit
+			end
+			faceDir(myHRP, dir)
 		end
-		faceDir(myHRP, dir)
 
 		setStunUi(true)
 	else
@@ -364,4 +405,4 @@ connect(RunService.Heartbeat, function()
 	end
 end)
 
-print("[WalkStun MultiGuest] UI bigger/lower applied.")
+print("[WalkStun MultiGuest] Single-guest=±80° random. Multi-guest=escape dir. UI bigger/lower applied.")
