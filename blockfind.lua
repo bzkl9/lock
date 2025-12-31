@@ -1,12 +1,9 @@
 -- LocalScript (StarterPlayer > StarterPlayerScripts)
--- Multi-Guest turn away + slowdown stun, with BIGGER + LOWER "STUNNED" box
--- NEW: if only ONE guest is triggering, turn random left/right by 80 degrees.
+-- BlockFind / WalkStun: multi-guest-safe turning + slowdown stun + BIGGER/LOWER "STUNNED" box
+-- NOTE: This is written to be safe when run via loadstring: waits for LocalPlayer/Character/PlayerGui.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-
-local LOCAL_PLAYER = Players.LocalPlayer
-if not LOCAL_PLAYER then return end
 
 --========================
 -- CONFIG
@@ -22,10 +19,10 @@ local APPLY_SLOW_EVERY_FRAME = true
 
 local TURN_LERP_ALPHA = 0.55
 
--- NEW: single-guest turn behavior
+-- single-guest: rotate direction-to-guest by +/- degrees (picked once per stun)
 local SINGLE_GUEST_TURN_DEGREES = 80
 
--- UI tuning (NEW)
+-- UI tuning
 local STUN_BOX_SIZE = UDim2.new(0, 520, 0, 150)  -- bigger
 local STUN_BOX_POS  = UDim2.new(0.5, 0, 0.26, 0) -- slightly lower
 
@@ -36,6 +33,32 @@ if _G.GuestRadiusWalkStun and type(_G.GuestRadiusWalkStun.Cleanup) == "function"
 	pcall(function() _G.GuestRadiusWalkStun.Cleanup() end)
 end
 
+--========================
+-- WAIT FOR LOCALPLAYER (loadstring-friendly)
+--========================
+local function waitForLocalPlayer(timeoutSeconds)
+	local t = 0
+	local lp = Players.LocalPlayer
+	while not lp and t < (timeoutSeconds or 10) do
+		task.wait(0.1)
+		t += 0.1
+		lp = Players.LocalPlayer
+	end
+	return lp
+end
+
+local LOCAL_PLAYER = waitForLocalPlayer(10)
+if not LOCAL_PLAYER then
+	warn("[WalkStun] No LocalPlayer (are you running this on the server?).")
+	return
+end
+
+-- Seed random once (keeps left/right actually random across sessions)
+pcall(function() math.randomseed(os.clock() * 1000000) end)
+
+--========================
+-- CONTROLLER
+--========================
 local ctrl = {
 	conns = {},
 	running = true,
@@ -43,22 +66,26 @@ local ctrl = {
 	stunUntil = 0,
 	wasCondTrue = false,
 
+	-- per-stun chosen side for single-guest turn
+	turnSign = 1, -- +1 right, -1 left
+
+	-- restore
 	stunned = false,
 	savedWalkSpeed = nil,
 	savedJumpPower = nil,
 	savedAutoRotate = nil,
 
+	-- killer sprint multiplier restore
 	stunWasKiller = false,
 	sprintObj = nil,
 	sprintOriginal = nil,
 
+	-- ui
 	gui = nil,
 	box = nil,
 
+	-- multi-guest smoothing memory
 	lastEscapeDir = nil,
-
-	-- NEW: chosen direction for single-guest turn during a stun
-	turnSign = 1, -- +1 right, -1 left
 }
 
 _G.GuestRadiusWalkStun = ctrl
@@ -75,12 +102,30 @@ function ctrl.Cleanup()
 		pcall(function() c:Disconnect() end)
 	end
 	ctrl.conns = {}
+
+	-- restore if we were mid-stun
+	local char = LOCAL_PLAYER.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and ctrl.stunned then
+		pcall(function()
+			if ctrl.sprintObj and ctrl.sprintOriginal ~= nil then
+				ctrl.sprintObj.Value = ctrl.sprintOriginal
+			end
+			if ctrl.savedAutoRotate ~= nil then hum.AutoRotate = ctrl.savedAutoRotate end
+			if ctrl.savedWalkSpeed ~= nil then hum.WalkSpeed = ctrl.savedWalkSpeed end
+			if ctrl.savedJumpPower ~= nil then hum.JumpPower = ctrl.savedJumpPower end
+		end)
+	end
+
 	if ctrl.gui then
 		pcall(function() ctrl.gui:Destroy() end)
 	end
 	ctrl.gui, ctrl.box = nil, nil
 end
 
+--========================
+-- HELPERS
+--========================
 local function getMyHumanoidAndHRP()
 	local char = LOCAL_PLAYER.Character
 	if not char then return nil, nil end
@@ -182,10 +227,15 @@ local function findMyKillerSprintingValue()
 end
 
 --========================
--- UI (UPDATED size/pos)
+-- UI
 --========================
 local function makeStunGui()
-	local playerGui = LOCAL_PLAYER:WaitForChild("PlayerGui")
+	local playerGui = LOCAL_PLAYER:FindFirstChild("PlayerGui") or LOCAL_PLAYER:WaitForChild("PlayerGui", 10)
+	if not playerGui then
+		warn("[WalkStun] No PlayerGui found; UI disabled.")
+		return nil, nil
+	end
+
 	local old = playerGui:FindFirstChild("WalkStunOverlayGui")
 	if old then old:Destroy() end
 
@@ -241,7 +291,6 @@ end
 --========================
 -- TURNING
 --========================
--- multi-guest escape direction
 local function computeEscapeDir(myPos, guestParts)
 	if #guestParts == 0 then return nil end
 	local sum = Vector3.zero
@@ -260,7 +309,6 @@ local function computeEscapeDir(myPos, guestParts)
 	return sum.Unit
 end
 
--- single-guest: rotate direction-to-guest by +/- degrees
 local function faceTurned(myHRP, guestPart, sign, degrees)
 	if not myHRP or not guestPart then return end
 
@@ -282,16 +330,21 @@ local function faceTurned(myHRP, guestPart, sign, degrees)
 	myHRP.CFrame = CFrame.new(myPos, myPos + dir)
 end
 
--- multi-guest: face a direction with smoothing
 local function faceDir(myHRP, dir)
 	if not myHRP or not dir then return end
 	local pos = myHRP.Position
+
+	-- Guard: avoid unit on zero vector
+	if dir.Magnitude < 1e-6 then return end
+	dir = dir.Unit
+
 	if ctrl.lastEscapeDir then
 		local blended = ctrl.lastEscapeDir:Lerp(dir, TURN_LERP_ALPHA)
 		if blended.Magnitude > 0.001 then
 			dir = blended.Unit
 		end
 	end
+
 	ctrl.lastEscapeDir = dir
 	myHRP.CFrame = CFrame.new(pos, pos + dir)
 end
@@ -305,9 +358,11 @@ local function applySlow(hum, hrp)
 			ctrl.sprintObj = findMyKillerSprintingValue()
 			if ctrl.sprintObj then ctrl.sprintOriginal = ctrl.sprintObj.Value end
 		end
+
 		if ctrl.sprintObj and ctrl.sprintOriginal ~= nil then
 			local currentSpeed = (hrp and hrp.AssemblyLinearVelocity.Magnitude) or 0
 			currentSpeed = math.max(currentSpeed, 0.1)
+
 			local desiredFactor = WALK_SPEED_TARGET / currentSpeed
 			local factor = math.clamp(desiredFactor, MIN_SPRINT_MULT_FACTOR, 1)
 			ctrl.sprintObj.Value = ctrl.sprintOriginal * factor
@@ -320,7 +375,6 @@ local function applySlow(hum, hrp)
 end
 
 local function startStun(hum)
-	-- NEW: pick a random turn direction for single-guest mode
 	ctrl.turnSign = (math.random(0, 1) == 0) and -1 or 1
 
 	ctrl.stunWasKiller = isLocalKiller(hum)
@@ -331,22 +385,27 @@ end
 local function beginStunIfNeeded(hum)
 	if ctrl.stunned then return end
 	ctrl.stunned = true
+
 	ctrl.savedWalkSpeed = hum.WalkSpeed
 	ctrl.savedJumpPower = hum.JumpPower
 	ctrl.savedAutoRotate = hum.AutoRotate
+
 	hum.AutoRotate = false
+
 	ctrl.sprintObj, ctrl.sprintOriginal = nil, nil
 end
 
 local function endStun(hum)
 	if not ctrl.stunned then return end
 	ctrl.stunned = false
+
 	if ctrl.sprintObj and ctrl.sprintOriginal ~= nil then
 		pcall(function() ctrl.sprintObj.Value = ctrl.sprintOriginal end)
 	end
 	ctrl.sprintObj, ctrl.sprintOriginal = nil, nil
 	ctrl.stunWasKiller = false
 	ctrl.lastEscapeDir = nil
+
 	if ctrl.savedAutoRotate ~= nil then hum.AutoRotate = ctrl.savedAutoRotate end
 	if ctrl.savedWalkSpeed ~= nil then hum.WalkSpeed = ctrl.savedWalkSpeed end
 	if ctrl.savedJumpPower ~= nil then hum.JumpPower = ctrl.savedJumpPower end
@@ -381,19 +440,19 @@ connect(RunService.Heartbeat, function()
 
 	if stunnedNow then
 		beginStunIfNeeded(hum)
+
 		if APPLY_SLOW_EVERY_FRAME then
 			applySlow(hum, myHRP)
 		end
 
 		-- TURN LOGIC:
 		if #guestParts == 1 then
-			-- single guest: turn left/right randomly by 80 degrees
 			faceTurned(myHRP, guestParts[1], ctrl.turnSign, SINGLE_GUEST_TURN_DEGREES)
 		else
-			-- multiple guests: escape direction (no weird overlap)
 			local dir = computeEscapeDir(myHRP.Position, guestParts)
 			if not dir then
-				dir = ctrl.lastEscapeDir or Vector3.new(myHRP.CFrame.LookVector.X, 0, myHRP.CFrame.LookVector.Z).Unit
+				local lv = myHRP.CFrame.LookVector
+				dir = Vector3.new(lv.X, 0, lv.Z)
 			end
 			faceDir(myHRP, dir)
 		end
@@ -405,4 +464,4 @@ connect(RunService.Heartbeat, function()
 	end
 end)
 
-print("[WalkStun MultiGuest] Single-guest=±80° random. Multi-guest=escape dir. UI bigger/lower applied.")
+print("[WalkStun] Loaded: single guest = +/-80 deg random; multi guest = escape dir; UI bigger/lower.")
