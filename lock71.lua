@@ -183,6 +183,18 @@ local MIN_TRIALS_FOR_TREND = 4
 -- mild elevation differences while still filtering out large height gaps.
 local VERTICAL_HEIGHT_THRESHOLD = 7
 
+-- Minimum number of recorded post‑windup trials (across both E and Q) before
+-- the pre‑windup pattern recognition for Q is allowed to adjust the aim.  When
+-- this value is greater than zero, the aim assist will not immediately
+-- snap to the opposite side on the very first Q cast simply because the
+-- target was running in one direction during the windup.  Instead, it will
+-- require that at least a handful of trials (hits or misses) have been
+-- recorded beforehand, ensuring that premature adaptation does not occur.
+-- You can tune this value; a value of 1 means at least one trial must
+-- exist before the pre‑windup pattern is used.  A larger number makes the
+-- system even more conservative.
+local MIN_TRIALS_FOR_PREWINDUP = 1
+
 -- NEW: list of animation IDs that indicate the player is sprinting.  When
 -- one of these animations plays we mark the player as running and allow
 -- the normal velocity sampling to update `runSpeed`.  We do not set
@@ -1100,15 +1112,27 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
     -- Determine the predominant pre‑windup direction for Q casts.  If the
     -- player has been moving predominantly in one direction during the
     -- windup (based on accumulated lateral velocity signs), we anticipate
-    -- that they may dodge in the opposite direction.  We use this when
-    -- adaptation has not yet engaged (not enough dodges) and only during
-    -- Q windups.
+    -- that they may dodge in the opposite direction.  To avoid premature
+    -- adaptation on the very first cast, this pattern recognition is only
+    -- enabled once a minimum number of post‑windup trials have been
+    -- recorded (controlled by MIN_TRIALS_FOR_PREWINDUP).
     local dominantPreDir = nil
-    if profAll and profAll.preWindupDirCountQ and profAll.preWindupDirCountQ >= 3 then
-        local total = profAll.preWindupDirCountQ
-        local sum = profAll.preWindupDirSumQ or 0
-        if math.abs(sum) >= 0.6 * total then
-            dominantPreDir = (sum > 0) and 1 or -1
+    do
+        -- Only attempt to use pre‑windup data if the profile exists and
+        -- enough trials have been recorded overall.  Without at least a
+        -- couple of trials the aim assist will not snap to the opposite side
+        -- simply because the target ran in one direction during the windup.
+        if profAll then
+            local totalTrialsPQ = ((profAll.E and profAll.E.trials) or 0) + ((profAll.Q and profAll.Q.trials) or 0)
+            if totalTrialsPQ >= MIN_TRIALS_FOR_PREWINDUP then
+                if profAll.preWindupDirCountQ and profAll.preWindupDirCountQ >= 3 then
+                    local total = profAll.preWindupDirCountQ
+                    local sum = profAll.preWindupDirSumQ or 0
+                    if math.abs(sum) >= 0.6 * total then
+                        dominantPreDir = (sum > 0) and 1 or -1
+                    end
+                end
+            end
         end
     end
 
@@ -1421,10 +1445,17 @@ local inputBeganConn = UIS.InputBegan:Connect(function(input, gpe)
 
     if input.KeyCode == Enum.KeyCode.E or input.KeyCode == Enum.KeyCode.Q then
         local keyStr = (input.KeyCode == Enum.KeyCode.E) and "E" or "Q"
-        -- schedule post-windup recording for the locked target (if any)
+        -- schedule post-windup recording for the current target.  If a target
+        -- is locked on (aimActive) schedule for that target.  Otherwise, if
+        -- a target is highlighted (red highlight) schedule for that target
+        -- instead.  This allows collecting dodge data even when you choose
+        -- not to lock on immediately during a windup.
         if aimActive and lockedTarget then
             local expires = tick() + (windups[keyStr] or 0.75) + PRE_RELEASE_MARGIN
             schedulePostWindupRecording(lockedTarget, keyStr, expires)
+        elseif redHighlightedTarget and redHighlightedTarget.Parent then
+            local expires = tick() + (windups[keyStr] or 0.75) + PRE_RELEASE_MARGIN
+            schedulePostWindupRecording(redHighlightedTarget, keyStr, expires)
         end
         charging = true
         chargeKey = input.KeyCode
