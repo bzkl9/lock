@@ -123,8 +123,8 @@ local targetBias = {head = 0.25, torso = 0.75}
 local RECORD_MAX_DISTANCE = 60
 local RECENT_HISTORY_KEEP = 24
 
-local ADAPT_MIN_TRIALS = 7
-local ADAPT_EARLY_SAME = 3
+local ADAPT_MIN_TRIALS = 300
+local ADAPT_EARLY_SAME = 2
 local ADAPT_MIN_AVG_DELTA = 0.6
 local ADAPT_MIN_LATERAL = 0.5
 local MAX_LATERAL_FRACTION = 0.35
@@ -134,7 +134,7 @@ local PRE_RELEASE_MARGIN = 0.25 -- unused for animation gating now
 -- NEW: post-windup record & fixed-lateral settings
 local POST_RECORD_DURATION = 0.8        -- seconds post windup (adjust as needed)
 local MAX_DODGE_DISTANCE = 6.0
-local FIXED_LATERAL = 4.5
+local FIXED_LATERAL = 2.5
 local POST_EDGE_WINDOW = 0.18
 local EWMA_ALPHA = 0.25
 local PRE_RECORD_WINDOW = 0.18
