@@ -122,7 +122,7 @@ local targetBias = {head = 0.25, torso = 0.75}
 local RECORD_MAX_DISTANCE = 60
 local RECENT_HISTORY_KEEP = 24
 
-local ADAPT_MIN_TRIALS = 7
+local ADAPT_MIN_TRIALS = 72
 local ADAPT_EARLY_SAME = 3
 local ADAPT_MIN_AVG_DELTA = 0.6
 local ADAPT_MIN_LATERAL = 0.5
