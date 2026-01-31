@@ -133,7 +133,7 @@ local PRE_RELEASE_MARGIN = 0.25 -- unused for animation gating now
 -- NEW: post-windup record & fixed-lateral settings
 local POST_RECORD_DURATION = 0.8        -- seconds post windup (default; dynamic duration will override)
 local MAX_DODGE_DISTANCE = 6.0
-local FIXED_LATERAL = 2.0
+local FIXED_LATERAL = 1.5
 local POST_EDGE_WINDOW = 0.18
 local EWMA_ALPHA = 0.25
 local PRE_RECORD_WINDOW = 0.18
@@ -1644,4 +1644,5 @@ if RunService:IsStudio() then
     warn(("[AimAssist] TEMP TREND CONFIG: IMMEDIATE_MIN_PEAK=%.2f DURATION=%.2fs PRE_SNAP_TIME=%.2fs MAX_LEAD_ABS=%.2f MAX_LEAD_FRAC=%.2f"):format(IMMEDIATE_TREND_MIN_PEAK, TEMPORARY_TREND_DURATION, PRE_SNAP_TIME, MAX_LEAD_ABS, MAX_LEAD_FRACTION))
 
 end
+
 
