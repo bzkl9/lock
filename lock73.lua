@@ -122,8 +122,8 @@ local targetBias = {head = 0.25, torso = 0.75}
 local RECORD_MAX_DISTANCE = 60
 local RECENT_HISTORY_KEEP = 24
 
-local ADAPT_MIN_TRIALS = 70
-local ADAPT_EARLY_SAME = 4
+local ADAPT_MIN_TRIALS = 7
+local ADAPT_EARLY_SAME = 3
 local ADAPT_MIN_AVG_DELTA = 0.6
 local ADAPT_MIN_LATERAL = 0.5
 local MAX_LATERAL_FRACTION = 0.35
@@ -133,7 +133,7 @@ local PRE_RELEASE_MARGIN = 0.25 -- unused for animation gating now
 -- NEW: post-windup record & fixed-lateral settings
 local POST_RECORD_DURATION = 0.8        -- seconds post windup (default; dynamic duration will override)
 local MAX_DODGE_DISTANCE = 6.0
-local FIXED_LATERAL = 2.0
+local FIXED_LATERAL = 2.5
 local POST_EDGE_WINDOW = 0.18
 local EWMA_ALPHA = 0.25
 local PRE_RECORD_WINDOW = 0.18
@@ -741,13 +741,16 @@ local function startPostWindupRecording(targetChar, key)
                 end
                 if profAll.trendStableCount >= HYSTERESIS_REQUIRED then
                     -- Only accept a stable trend when the target has dodged
-                    -- consecutively at least twice.  We remove the requirement
-                    -- for a minimum number of trials to allow faster adaptation.
+                    -- enough consecutive times (controlled by ADAPT_EARLY_SAME)
+                    -- OR when a minimum number of total post‑windup trials have been
+                    -- recorded (ADAPT_MIN_TRIALS).  This prevents trend locking
+                    -- on extremely limited data or lucky dodges/hits.
                     local ok, totalTrials = pcall(function()
                         return ((profAll.E and profAll.E.trials) or 0) + ((profAll.Q and profAll.Q.trials) or 0)
                     end)
                     if not ok then totalTrials = 0 end
-                    if (profAll.consecutiveDodges or 0) >= 2 then
+                    local cons = profAll.consecutiveDodges or 0
+                    if cons >= ADAPT_EARLY_SAME or totalTrials >= ADAPT_MIN_TRIALS then
                         profAll.lastTrend = newTrendName
                         profAll.lastTrendTime = tick()
                     end
@@ -927,13 +930,19 @@ local function computeAdaptDecisionForPlayer(pl)
         end
     end
 
-    -- Determine whether adaptation should be enabled.  Require at least two
-    -- consecutive dodges and no alternating zig‑zag pattern.  This ensures
-    -- adaptation is only applied when the target consistently dodges in
-    -- one direction and has not recently switched sides.
+    -- Determine whether adaptation should be enabled.  Require either
+    -- a sufficient number of consecutive dodges (controlled by ADAPT_EARLY_SAME)
+    -- or a minimum number of total trials (ADAPT_MIN_TRIALS) and no alternating
+    -- zig‑zag pattern.  This allows tuning for early adaptation based on
+    -- consistent behaviour while preventing adaptation when only a few
+    -- (possibly lucky) dodges have been observed.
     local adapt = false
     if not patternAlternate then
-        if (profAll.consecutiveDodges or 0) >= 2 then
+        local cons = profAll.consecutiveDodges or 0
+        local totalTrialsGuard = totalTrials
+        -- enable adaptation when either enough consecutive dodges are observed
+        -- or enough total trials have been recorded
+        if cons >= ADAPT_EARLY_SAME or totalTrialsGuard >= ADAPT_MIN_TRIALS then
             adapt = true
         end
     end
@@ -1185,10 +1194,29 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
         elseif chargeKey and chargeKey == Enum.KeyCode.Q and dominantPreDir then
             -- Not enough dodges yet; anticipate an opposite dodge based on
             -- pre‑windup movement.  If the player ran to the right (dominant
-            -- positive), we aim left, and vice versa.
-            lateralApplied = -dominantPreDir * FIXED_LATERAL
-            if owner then
-                warn(("[AimAssist] PREWINDUP Q PATTERN uid=%d dominantDir=%s applied lateral=%.2f"):format(owner.UserId, tostring(dominantPreDir), lateralApplied))
+            -- positive), we aim left, and vice versa.  However, only apply
+            -- this early adaptation when either a sufficient number of
+            -- consecutive dodges has been observed (ADAPT_EARLY_SAME) or
+            -- a minimum number of trials has accumulated (ADAPT_MIN_TRIALS).
+            local earlyAdaptAllowed = false
+            do
+                local totalTrialsGuard = 0
+                pcall(function()
+                    totalTrialsGuard = ((profAll.E and profAll.E.trials) or 0) + ((profAll.Q and profAll.Q.trials) or 0)
+                end)
+                local cons = profAll.consecutiveDodges or 0
+                if cons >= ADAPT_EARLY_SAME or totalTrialsGuard >= ADAPT_MIN_TRIALS then
+                    earlyAdaptAllowed = true
+                end
+            end
+            if earlyAdaptAllowed then
+                lateralApplied = -dominantPreDir * FIXED_LATERAL
+                if owner then
+                    warn(("[AimAssist] PREWINDUP Q PATTERN uid=%d dominantDir=%s applied lateral=%.2f"):format(owner.UserId, tostring(dominantPreDir), lateralApplied))
+                end
+            else
+                -- If early adaptation is not allowed, apply only the small lateral nudge
+                predicted = predicted + lateralVel * lateralBoost * s
             end
         else
             -- non-adapt path: keep the small lateral velocity nudge (this is small by design)
@@ -1642,7 +1670,4 @@ if RunService:IsStudio() then
     warn(("[AimAssist] DETUNING: MIN_MOVE_MAG=%.2f DIR_THRESHOLD=%.2f SMALL_DELTA_THRESHOLD=%.2f HYST=%d STALE=%.1fs")
          :format(MIN_MOVE_MAG, DIR_THRESHOLD, SMALL_DELTA_THRESHOLD, HYSTERESIS_REQUIRED, STALE_TREND_TIMEOUT))
     warn(("[AimAssist] TEMP TREND CONFIG: IMMEDIATE_MIN_PEAK=%.2f DURATION=%.2fs PRE_SNAP_TIME=%.2fs MAX_LEAD_ABS=%.2f MAX_LEAD_FRAC=%.2f"):format(IMMEDIATE_TREND_MIN_PEAK, TEMPORARY_TREND_DURATION, PRE_SNAP_TIME, MAX_LEAD_ABS, MAX_LEAD_FRACTION))
-
 end
-
-
