@@ -265,6 +265,7 @@ local animationToKey = {
     ["83685305553364"]  = "Q", ["99030950661794"]  = "E",
     ["100592913030351"] = "Q", ["81935774508746"]  = "E",
     ["109777684604906"] = "Q", ["105026134432828"] = "E",
+    -- Additional animation IDs for Q/E provided by the user
     ["112598064360414"] = "Q", ["119181003138006"] = "E",
 }
 
@@ -1168,27 +1169,38 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
     --   1. Enough dodges: use temporaryTrend or lastTrend (or computed lateral) as before.
     --   2. Not enough dodges but Q windup with a dominant pre‑windup run direction: aim opposite.
     --   3. Otherwise, do not apply adaptation and use a small velocity nudge.
+    -- lateralApplied is the base lateral offset (in studs).  applyDistanceScale
+    -- indicates whether this offset should be scaled by distance; fixed offsets
+    -- (e.g. ±FIXED_LATERAL) are not scaled, whereas computed offsets (via
+    -- computeLateralStuds) are scaled by distance.
     local lateralApplied = 0
+    local applyDistanceScale = false
     if adaptAllowed and profAll then
         if enoughDodges then
             if profAll.temporaryTrend and profAll.temporaryTrendExpiry and tick() <= profAll.temporaryTrendExpiry then
                 if profAll.temporaryTrend == "Right" then
                     lateralApplied = FIXED_LATERAL
+                    applyDistanceScale = false
                 elseif profAll.temporaryTrend == "Left" then
                     lateralApplied = -FIXED_LATERAL
+                    applyDistanceScale = false
                 end
                 if owner then
                     warn(("[AimAssist] USING TEMP TREND uid=%d trend=%s expiry=%.2f"):format(owner.UserId, profAll.temporaryTrend, profAll.temporaryTrendExpiry))
                 end
             elseif profAll.lastTrend == "Right" then
                 lateralApplied = FIXED_LATERAL
+                applyDistanceScale = false
             elseif profAll.lastTrend == "Left" then
                 lateralApplied = -FIXED_LATERAL
+                applyDistanceScale = false
             else
                 -- fallback: if adaptation decision is true, use computed lateral
                 if adaptInfo and adaptInfo.adapt then
                     local runSpeed = (profAll and profAll.runSpeed) or math.max(targetSpeed,6)
                     lateralApplied = computeLateralStuds(adaptInfo, runSpeed, distance, t)
+                    -- computed lateral offsets should be scaled by distance
+                    if math.abs(lateralApplied) > 0 then applyDistanceScale = true else applyDistanceScale = false end
                 end
             end
         elseif chargeKey and chargeKey == Enum.KeyCode.Q and dominantPreDir then
@@ -1211,6 +1223,7 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
             end
             if earlyAdaptAllowed then
                 lateralApplied = -dominantPreDir * FIXED_LATERAL
+                applyDistanceScale = false
                 if owner then
                     warn(("[AimAssist] PREWINDUP Q PATTERN uid=%d dominantDir=%s applied lateral=%.2f"):format(owner.UserId, tostring(dominantPreDir), lateralApplied))
                 end
@@ -1227,9 +1240,11 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
         predicted = predicted + lateralVel * lateralBoost * s
     end
 
-    -- Precompute a scale factor for the lateral offset.  When adaptation is
-    -- allowed this scales the lateral shift by distance to compensate for
-    -- large forward leads.  Otherwise the factor is 1 (no scaling).
+    -- Precompute a scale factor for the lateral offset.  Computed lateral
+    -- offsets (from computeLateralStuds) are scaled by distance to
+    -- compensate for large forward leads.  Fixed offsets (±FIXED_LATERAL)
+    -- are not scaled.  The scale factor is only applied when adaptation is
+    -- allowed.
     local scaleFactor = 1
     if adaptAllowed then
         scaleFactor = 1 + distance * LATERAL_DISTANCE_SCALE
@@ -1283,9 +1298,14 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
             -- computed lateralApplied (which may have been inverted) scaled by
             -- the distance factor.
             if math.abs(lateralApplied) > 0 then
-                predicted = predicted + rightDir * (lateralApplied * scaleFactor)
+                -- scale the lateral offset only if applyDistanceScale is true
+                local scaledOffset = lateralApplied
+                if applyDistanceScale and adaptAllowed then
+                    scaledOffset = lateralApplied * scaleFactor
+                end
+                predicted = predicted + rightDir * scaledOffset
                 if owner then
-                    warn(("[AimAssist] WINDUP SNAP uid=%d lateral=%.2f (scaled=%.2f) timeLeft=%.3f"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), timeLeft))
+                    warn(("[AimAssist] WINDUP SNAP uid=%d lateral=%.2f (scaled=%.2f) timeLeft=%.3f"):format(owner.UserId, lateralApplied, (applyDistanceScale and (lateralApplied * scaleFactor) or lateralApplied), timeLeft))
                 end
             end
             return predicted
@@ -1296,7 +1316,11 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
         -- apply lateral immediately for snap.  Use scaled lateral if adaptation
         -- is allowed, otherwise apply the raw lateral offset.
         if math.abs(lateralApplied) > 0 then
-            predicted = predicted + rightDir * (lateralApplied * scaleFactor)
+            local scaledOffset = lateralApplied
+            if applyDistanceScale and adaptAllowed then
+                scaledOffset = lateralApplied * scaleFactor
+            end
+            predicted = predicted + rightDir * scaledOffset
         end
         return predicted
     end
@@ -1307,9 +1331,13 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
     -- **apply the lateral AFTER blending** so it isn't averaged away.  Use
     -- scaleFactor to enlarge the offset at longer distances.
     if math.abs(lateralApplied) > 0 then
-        blended = blended + rightDir * (lateralApplied * scaleFactor)
+        local scaledOffset = lateralApplied
+        if applyDistanceScale and adaptAllowed then
+            scaledOffset = lateralApplied * scaleFactor
+        end
+        blended = blended + rightDir * scaledOffset
         if owner then
-            warn(("[AimAssist] ADAPT APPLY uid=%d lateral=%.2f scaled=%.2f lastTrend=%s"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), (profAll.lastTrend or "nil")))
+            warn(("[AimAssist] ADAPT APPLY uid=%d lateral=%.2f scaled=%.2f lastTrend=%s"):format(owner.UserId, lateralApplied, (applyDistanceScale and (lateralApplied * scaleFactor) or lateralApplied), (profAll.lastTrend or "nil")))
         end
     end
 
@@ -1671,4 +1699,3 @@ if RunService:IsStudio() then
          :format(MIN_MOVE_MAG, DIR_THRESHOLD, SMALL_DELTA_THRESHOLD, HYSTERESIS_REQUIRED, STALE_TREND_TIMEOUT))
     warn(("[AimAssist] TEMP TREND CONFIG: IMMEDIATE_MIN_PEAK=%.2f DURATION=%.2fs PRE_SNAP_TIME=%.2fs MAX_LEAD_ABS=%.2f MAX_LEAD_FRAC=%.2f"):format(IMMEDIATE_TREND_MIN_PEAK, TEMPORARY_TREND_DURATION, PRE_SNAP_TIME, MAX_LEAD_ABS, MAX_LEAD_FRACTION))
 end
-
