@@ -531,7 +531,7 @@ local function startPostWindupRecording(targetChar, key)
         task.delay(recordDuration, function()
             if not targetChar or not targetChar.Parent then return end
             local hum = targetChar:FindFirstChild("Humanoid")
-            if hum and startHealth and (startHealth - hum.Health) >= 10 then
+            if hum and startHealth and (startHealth - hum.Health) >= 3 then
                 hitDetected = true
                 targetProfiles[uid][key].hits = (targetProfiles[uid][key].hits or 0) + 1
             end
@@ -1431,10 +1431,44 @@ local function onCharacterAnimationPlayed(character)
             end)
         end)
 
-        -- schedule the post-windup recording AFTER the cast/windup expires (no in-windup samples)
-        schedulePostWindupRecording(character, key, profAll.lastCast.expires)
-
-        warn(("[AimAssist] noted animation uid=%d key=%s duration=%.2f expires=%.2f (post-record scheduled)"):format(owner.UserId, key, duration, profAll.lastCast.expires))
+        -- Only schedule a post‑windup recording when this character is
+        -- currently highlighted or locked by the local player.  This
+        -- prevents sampling trials for players we are not focused on and
+        -- ensures adaptation is built separately for each target.  The
+        -- recording is scheduled after the cast/windup expires (no in‑windup samples).
+        do
+            local shouldRecord = false
+            if aimActive and lockedTarget and lockedTarget.Parent and lockedTarget == character then
+                shouldRecord = true
+            elseif redHighlightedTarget and redHighlightedTarget.Parent and redHighlightedTarget == character then
+                shouldRecord = true
+            end
+            if shouldRecord then
+                schedulePostWindupRecording(character, key, profAll.lastCast.expires)
+                -- Update local casting/charge state when the animation is played for the locked or highlighted target.
+                -- This ensures predictedAimPoint adapts only when an actual cast animation occurs (not on key press).
+                -- Set global chargeKey and chargeExpires to drive windup logic for the locked target.
+                if character == lockedTarget then
+                    if key == "E" then
+                        chargeKey = Enum.KeyCode.E
+                    else
+                        chargeKey = Enum.KeyCode.Q
+                    end
+                    chargeStart = tick()
+                    chargeExpires = profAll.lastCast.expires
+                    -- Activate boost when Q animation plays (same behaviour as key press)
+                    if key == "Q" then
+                        boostActive = true
+                        boostMultiplier = 1.0 + 0.4
+                        boostEnd = tick() + 2.0
+                    end
+                end
+                warn(("[AimAssist] noted animation uid=%d key=%s duration=%.2f expires=%.2f (post-record scheduled)"):format(owner.UserId, key, duration, profAll.lastCast.expires))
+            else
+                -- If not recording for this character, we still update lastCast and casting state but skip recording
+                warn(("[AimAssist] noted animation uid=%d key=%s duration=%.2f expires=%.2f (no record for unhighlighted target)"):format(owner.UserId, key, duration, profAll.lastCast.expires))
+            end
+        end
     end)
     table.insert(animConns, conn); _G.AimAssistAnimConns = animConns
 end
@@ -1529,24 +1563,19 @@ local inputBeganConn = UIS.InputBegan:Connect(function(input, gpe)
     end
 
     if input.KeyCode == Enum.KeyCode.E or input.KeyCode == Enum.KeyCode.Q then
-        local keyStr = (input.KeyCode == Enum.KeyCode.E) and "E" or "Q"
-        -- schedule post-windup recording for the current target.  If a target
-        -- is locked on (aimActive) schedule for that target.  Otherwise, if
-        -- a target is highlighted (red highlight) schedule for that target
-        -- instead.  This allows collecting dodge data even when you choose
-        -- not to lock on immediately during a windup.
-        if aimActive and lockedTarget then
-            local expires = tick() + (windups[keyStr] or 0.75) + PRE_RELEASE_MARGIN
-            schedulePostWindupRecording(lockedTarget, keyStr, expires)
-        elseif redHighlightedTarget and redHighlightedTarget.Parent then
-            local expires = tick() + (windups[keyStr] or 0.75) + PRE_RELEASE_MARGIN
-            schedulePostWindupRecording(redHighlightedTarget, keyStr, expires)
-        end
+        -- Do not schedule post‑windup recording here.  We only record trials
+        -- when the corresponding E or Q animation is actually played (see
+        -- onCharacterAnimationPlayed).  This prevents sampling based on key
+        -- presses that might not correspond to ability casts.
         charging = true
         chargeKey = input.KeyCode
         chargeStart = tick()
-        chargeExpires = tick() + (windups[keyStr] or 0.75) -- used for local logic
-        if input.KeyCode == Enum.KeyCode.Q then boostActive = true; boostMultiplier = 1.0 + 0.4; boostEnd = tick() + 2.0 end
+        chargeExpires = tick() + (windups[(input.KeyCode == Enum.KeyCode.E) and "E" or "Q"] or 0.75)
+        if input.KeyCode == Enum.KeyCode.Q then
+            boostActive = true
+            boostMultiplier = 1.0 + 0.4
+            boostEnd = tick() + 2.0
+        end
         return
     end
 
@@ -1671,12 +1700,26 @@ _G.AimAssistConn = RunService.RenderStepped:Connect(function(dt)
             local myHRP = myChar.HumanoidRootPart
             local aimPoint = nil
 
-            -- chargingActive is true while within the windup window (so press -> lasts full windup even if released)
-            local chargingActive = (chargeExpires and tick() <= chargeExpires)
-
-            if chargingActive and chargeKey then
-                local keyStr = (chargeKey == Enum.KeyCode.E) and "E" or "Q"
-                aimPoint = predictedAimPoint(myHRP.Position, lockedTarget, keyStr, false, true)
+            -- Determine if the locked target is currently in a casting state based on animation.
+            -- We only allow adaptation during the actual E or Q animation, not just key presses.
+            local owner = Players:GetPlayerFromCharacter(lockedTarget)
+            local profAll = owner and targetProfiles[owner.UserId] or nil
+            local castingActive = false
+            local castKey = nil
+            if profAll and profAll.isCasting and profAll.lastCast and profAll.lastCast.expires and tick() <= profAll.lastCast.expires then
+                castingActive = true
+                -- Convert the recorded key string ("E" or "Q") to the corresponding Enum.KeyCode
+                if profAll.lastCast.key == "E" then
+                    castKey = Enum.KeyCode.E
+                else
+                    castKey = Enum.KeyCode.Q
+                end
+                -- Ensure global chargeExpires matches the cast expiry for windup timing.
+                chargeExpires = profAll.lastCast.expires
+            end
+            if castingActive and castKey then
+                -- Use the Enum.KeyCode as the chargeKey parameter to predictedAimPoint for correct Q/E gating
+                aimPoint = predictedAimPoint(myHRP.Position, lockedTarget, castKey, false, true)
             else
                 aimPoint = predictedAimPoint(myHRP.Position, lockedTarget, nil, false, false)
             end
