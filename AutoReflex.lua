@@ -1,0 +1,855 @@
+do
+local RunService = game:GetService("RunService")
+local PlayersService = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local workspace = workspace
+
+local LocalPlayer = PlayersService.LocalPlayer
+if not LocalPlayer then return end
+
+local SURVIVORS_PATH = {"Players", "Survivors"}
+-- Added JaneDoe to enable auto‑dodge for this survivor
+local TARGET_NAMES = { Guest1337 = true, Shedletsky = true, TwoTime = true, JaneDoe = true }
+local RESISTANCE_FOLDER_NAME = "ResistanceMultipliers"
+local RESISTANCE_VALUE_NAME = "ResistanceStatus"
+local TRIGGER_VALUES = { [20] = true, [40] = true }
+
+local DODGE_OVERRIDE_DURATION = 0.35
+local DODGE_COOLDOWN = 0.5
+local DODGE_RANGE = 20
+local MIN_SPEED_TO_TRIGGER = 0.2
+local DODGE_FORCE_P = 1e4
+local DODGE_FORCE_MAX = Vector3.new(1e5, 1e5, 1e5)
+local DODGE_MAX_SPEED = 19
+
+-- Face duration (0.5s requested)
+local FACE_OVERRIDE_DURATION = 0.5
+
+local ENABLE_AUTO_KILL_PREVIOUS = true
+local KILL_HOTKEY = Enum.KeyCode.K
+
+local WATCHED_ANIM_IDS = {
+    ["131430497821198"] = true,
+    ["119181003138006"] = true,
+    ["101101433684051"] = true,
+    ["116787687605496"] = true,
+    ["83685305553364"]  = true,
+    ["99030950661794"]  = true,
+    ["100592913030351"] = true,
+    ["81935774508746"]  = true,
+    ["109777684604906"] = true,
+    ["105026134432828"] = true,
+    ["119429069577280"] = true,
+    ["85667731859561"]  = true,
+    ["108757133541940"] = true,
+    ["130130264576253"] = true,
+    ["105747066695777"] = true,
+    ["126355327951215"] = true,
+    ["121086746534252"] = true,
+    ["126681776859538"] = true,
+    ["129976080405072"] = true,
+    ["106847695270773"] = true,
+    ["93284670378212"]  = true,
+}
+
+
+local running = true
+local connections = {}
+local watchedValues = {}
+local lastDodgeTime = 0
+local char, hrp, humanoid = nil, nil, nil
+local sprintValueInstance = nil
+local currentSprintMultiplier = 1
+local animatorConnection = nil
+
+if _G.AutoReflexController and _G.AutoReflexController ~= true then
+    _G.AutoReflexPrevious = _G.AutoReflexController
+end
+local controller = {}
+_G.AutoReflexController = controller
+
+local function safeFind(pathParts)
+    local node = workspace
+    for _, p in ipairs(pathParts) do
+        if not node then return nil end
+        node = node:FindFirstChild(p)
+    end
+    return node
+end
+
+local function findSurvivorsFolder()
+    return safeFind(SURVIVORS_PATH)
+end
+
+local function getModelPosition(model)
+    if not model then return nil end
+    if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+        return model.PrimaryPart.Position
+    end
+    local candidates = {"HumanoidRootPart", "Torso", "UpperTorso", "LowerTorso"}
+    for _, name in ipairs(candidates) do
+        local p = model:FindFirstChild(name)
+        if p and p:IsA("BasePart") then
+            return p.Position
+        end
+    end
+    local sum = Vector3.new(0,0,0)
+    local count = 0
+    for _, desc in ipairs(model:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            sum = sum + desc.Position
+            count = count + 1
+        end
+    end
+    if count > 0 then
+        return sum / count
+    end
+    return nil
+end
+
+local function killPreviousController()
+    if _G.AutoReflexPrevious then
+        pcall(function()
+            if type(_G.AutoReflexPrevious.Cleanup) == "function" then
+                _G.AutoReflexPrevious.Cleanup()
+            end
+        end)
+        _G.AutoReflexPrevious = nil
+    end
+end
+
+local function locateAndWatchSprintValue()
+    if sprintValueInstance and sprintValueInstance._conn then
+        pcall(function() sprintValueInstance._conn:Disconnect() end)
+        sprintValueInstance._conn = nil
+    end
+    sprintValueInstance = nil
+    currentSprintMultiplier = 1
+    local playersNode = workspace:FindFirstChild("Players")
+    if not playersNode then return end
+    local killersFolder = playersNode:FindFirstChild("Killers")
+    if not killersFolder then return end
+    local myKillerEntry = killersFolder:FindFirstChild(LocalPlayer.Name)
+    if not myKillerEntry then
+        local conn = killersFolder.ChildAdded:Connect(function(child)
+            if not running then conn:Disconnect(); return end
+            if child.Name == LocalPlayer.Name then
+                conn:Disconnect()
+                delay(0.05, locateAndWatchSprintValue)
+            end
+        end)
+        connections[#connections+1] = conn
+        return
+    end
+    local speedMultFolder = myKillerEntry:FindFirstChild("SpeedMultipliers")
+    if not speedMultFolder then
+        local conn = myKillerEntry.ChildAdded:Connect(function(child)
+            if not running then return end
+            if child.Name == "SpeedMultipliers" then
+                delay(0.05, locateAndWatchSprintValue)
+            end
+        end)
+        connections[#connections+1] = conn
+        return
+    end
+    local sprintVal = speedMultFolder:FindFirstChild("Sprinting")
+    if sprintVal and (sprintVal:IsA("NumberValue") or sprintVal:IsA("IntValue")) then
+        sprintValueInstance = sprintVal
+        currentSprintMultiplier = sprintVal.Value or 1
+        local conn = sprintVal:GetPropertyChangedSignal("Value"):Connect(function()
+            if not running then return end
+            currentSprintMultiplier = sprintVal.Value or 1
+        end)
+        sprintVal._conn = conn
+        connections[#connections+1] = conn
+    else
+        local conn2 = speedMultFolder.ChildAdded:Connect(function(child)
+            if not running then return end
+            if child.Name == "Sprinting" and (child:IsA("NumberValue") or child:IsA("IntValue")) then
+                delay(0.02, locateAndWatchSprintValue)
+            end
+        end)
+        connections[#connections+1] = conn2
+    end
+end
+
+local function getCurrentSpeed()
+    if sprintValueInstance and sprintValueInstance.Value then
+        local mv = tonumber(sprintValueInstance.Value) or currentSprintMultiplier or 1
+        return 8 * mv
+    end
+    if humanoid and humanoid.WalkSpeed then
+        return humanoid.WalkSpeed
+    end
+    return 8
+end
+
+local function isPlayingKiller()
+    if humanoid then
+        local okMax = humanoid.MaxHealth and humanoid.MaxHealth > 500
+        local okCur = humanoid.Health and humanoid.Health > 500
+        if okMax or okCur then
+            return true
+        end
+    end
+    local playersNode = workspace:FindFirstChild("Players")
+    if playersNode then
+        local killers = playersNode:FindFirstChild("Killers")
+        if killers and killers:FindFirstChild(LocalPlayer.Name) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Interrupt and cleanup any active overrides (dodge or face)
+local function interruptActiveOverrides()
+    -- active dodge cleanup
+    if controller._activeDodge then
+        local info = controller._activeDodge
+        controller._activeDodge = nil
+        pcall(function()
+            if info.bv and info.bv.Parent then
+                info.bv:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid then
+                humanoid.WalkSpeed = info.savedWalkSpeed or 16
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- active face cleanup
+    if controller._activeFace then
+        local info = controller._activeFace
+        controller._activeFace = nil
+        pcall(function()
+            if info.bg and info.bg.Parent then
+                info.bg:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.hbConn then info.hbConn:Disconnect() end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid and info.savedAutoRotate ~= nil then
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+end
+
+-- Add these two config constants near the other constants at the top:
+local TURN_SPEED_REDUCTION = 0.30      -- 30% slower while recovering from a forced turn
+local TURN_PENALTY_DURATION = 0.5     -- how long (seconds) the penalty lasts
+
+-- internal helper: clear any active turn penalty and restore WalkSpeed
+local function clearTurnPenalty()
+    if controller._activeTurn then
+        local tinfo = controller._activeTurn
+        controller._activeTurn = nil
+        pcall(function()
+            if humanoid and tinfo.savedWalkSpeed then
+                humanoid.WalkSpeed = tinfo.savedWalkSpeed
+            end
+        end)
+        if tinfo.dieConn then
+            pcall(function() tinfo.dieConn:Disconnect() end)
+        end
+    end
+end
+
+-- Interrupt and cleanup any active overrides (dodge or face) and turn penalties
+local function interruptActiveOverrides()
+    -- active dodge cleanup
+    if controller._activeDodge then
+        local info = controller._activeDodge
+        controller._activeDodge = nil
+        pcall(function()
+            if info.bv and info.bv.Parent then
+                info.bv:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid then
+                humanoid.WalkSpeed = info.savedWalkSpeed or 16
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- active face cleanup
+    if controller._activeFace then
+        local info = controller._activeFace
+        controller._activeFace = nil
+        pcall(function()
+            if info.bg and info.bg.Parent then
+                info.bg:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.hbConn then info.hbConn:Disconnect() end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid and info.savedAutoRotate ~= nil then
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- clear any turn penalty (restores walk speed)
+    clearTurnPenalty()
+end
+
+-- TURN penalty config (keep near other config if already defined)
+local TURN_SPEED_REDUCTION = 0.30      -- 30% slower while recovering from a forced turn
+local TURN_PENALTY_DURATION = 0.5     -- how long (seconds) the penalty lasts
+
+-- Helper: locate SpeedMultipliers folder for the local killer entry
+local function getMySpeedMultipliersFolder()
+    local playersNode = workspace:FindFirstChild("Players")
+    if not playersNode then return nil end
+    local killersFolder = playersNode:FindFirstChild("Killers")
+    if not killersFolder then return nil end
+    local myEntry = killersFolder:FindFirstChild(LocalPlayer.Name)
+    if not myEntry then return nil end
+    local speedMultFolder = myEntry:FindFirstChild("SpeedMultipliers")
+    return speedMultFolder
+end
+
+-- Helper: apply directional multiplier penalty (stores original so we can restore)
+local function applyDirectionalPenalty(multipliedValue)
+    local folder = getMySpeedMultipliersFolder()
+    if not folder then return false end
+    local dirVal = folder:FindFirstChild("DirectionalMovement")
+    if not dirVal or not (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then return false end
+
+    -- store original so we can restore
+    local orig = dirVal.Value
+    -- set the reduced value
+    pcall(function() dirVal.Value = multipliedValue end)
+
+    -- store in controller state so interrupts/cleanup can restore
+    controller._activeTurn = controller._activeTurn or {}
+    -- disconnect any previous dieConn we replaced
+    if controller._activeTurn.dirDieConn then
+        pcall(function() controller._activeTurn.dirDieConn:Disconnect() end)
+    end
+    controller._activeTurn.dirVal = dirVal
+    controller._activeTurn.origDirectional = orig
+
+    return true
+end
+
+-- Helper: restore directional multiplier if we previously changed it
+local function restoreDirectionalPenalty()
+    if not controller._activeTurn then return end
+    local t = controller._activeTurn
+    controller._activeTurn = nil
+    if t and t.dirVal and t.dirVal.Parent then
+        pcall(function() t.dirVal.Value = t.origDirectional end)
+    end
+    if t and t.dirDieConn then
+        pcall(function() t.dirDieConn:Disconnect() end)
+    end
+end
+
+-- Interrupt and cleanup any active overrides (dodge or face) and turn penalties
+local function interruptActiveOverrides()
+    -- active dodge cleanup (unchanged behavior for BV)
+    if controller._activeDodge then
+        local info = controller._activeDodge
+        controller._activeDodge = nil
+        pcall(function()
+            if info.bv and info.bv.Parent then
+                info.bv:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid then
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- active face cleanup (unchanged orientation cleanup)
+    if controller._activeFace then
+        local info = controller._activeFace
+        controller._activeFace = nil
+        pcall(function()
+            if info.bg and info.bg.Parent then
+                info.bg:Destroy()
+            end
+        end)
+        pcall(function()
+            if info.hbConn then info.hbConn:Disconnect() end
+        end)
+        pcall(function()
+            if info.dieConn then info.dieConn:Disconnect() end
+        end)
+        pcall(function()
+            if humanoid and info.savedAutoRotate ~= nil then
+                humanoid.AutoRotate = info.savedAutoRotate
+            end
+        end)
+    end
+
+    -- restore any directional multiplier penalty we applied
+    restoreDirectionalPenalty()
+end
+
+-- Back dodge with BodyVelocity; after the dodge we apply a short directional penalty
+local function performBackDodgeOverride()
+    if not isPlayingKiller() then return end
+    if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
+    lastDodgeTime = tick()
+    if not char or not hrp or not humanoid then return end
+    local speed = getCurrentSpeed()
+    if speed < MIN_SPEED_TO_TRIGGER then return end
+    if DODGE_MAX_SPEED and type(DODGE_MAX_SPEED) == "number" then
+        speed = math.min(speed, DODGE_MAX_SPEED)
+    end
+    local back = -hrp.CFrame.LookVector
+    local backHoriz = Vector3.new(back.X, 0, back.Z)
+    if backHoriz.Magnitude < 0.001 then return end
+    backHoriz = backHoriz.Unit
+    local savedAutoRotate = humanoid.AutoRotate
+
+    -- disable autorotate and zero walk speed so BV carries motion externally
+    humanoid.AutoRotate = false
+    humanoid.WalkSpeed = 0
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Name = "AutoReflexBackDodge"
+    local maxForceHoriz
+    if typeof(DODGE_FORCE_MAX) == "Vector3" then
+        maxForceHoriz = Vector3.new(DODGE_FORCE_MAX.X, 0, DODGE_FORCE_MAX.Z)
+    else
+        local scalar = tonumber(DODGE_FORCE_MAX) or 1e5
+        maxForceHoriz = Vector3.new(scalar, 0, scalar)
+    end
+    local preservedY = 0
+    pcall(function()
+        if hrp and hrp:IsA("BasePart") then
+            preservedY = hrp.Velocity.Y or 0
+        end
+    end)
+    bv.MaxForce = maxForceHoriz
+    bv.P = DODGE_FORCE_P
+    bv.Velocity = Vector3.new(backHoriz.X * speed, preservedY, backHoriz.Z * speed)
+    bv.Parent = hrp
+
+    local dieConn
+    dieConn = humanoid.Died:Connect(function()
+        if bv and bv.Parent then
+            pcall(function() bv:Destroy() end)
+        end
+        if dieConn then
+            pcall(function() dieConn:Disconnect() end)
+        end
+    end)
+
+    controller._activeDodge = {
+        bv = bv,
+        savedAutoRotate = savedAutoRotate,
+        dieConn = dieConn
+    }
+
+    if ENABLE_AUTO_KILL_PREVIOUS then
+        killPreviousController()
+    end
+
+    -- after the dodge duration: destroy BV and apply directional penalty
+    delay(DODGE_OVERRIDE_DURATION, function()
+        if not controller then return end
+        local info = controller._activeDodge
+        controller._activeDodge = nil
+        if info and info.bv and info.bv.Parent then
+            pcall(function() info.bv:Destroy() end)
+        end
+
+        -- Attempt to apply directional multiplier penalty based on current DirectionalMovement
+        local applied = false
+        local folder = getMySpeedMultipliersFolder()
+        if folder then
+            local dirVal = folder:FindFirstChild("DirectionalMovement")
+            if dirVal and (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then
+                local orig = dirVal.Value or 1
+                local newVal = math.max(0.01, orig * (1 - TURN_SPEED_REDUCTION))
+                applied = applyDirectionalPenalty(newVal)
+                -- register character death to restore if necessary
+                if applied and info and info.dieConn then
+                    -- store dieConn so restore can disconnect it on death
+                    controller._activeTurn.dirDieConn = info.dieConn
+                end
+                -- schedule full restore after the penalty duration
+                if applied then
+                    delay(TURN_PENALTY_DURATION, function()
+                        -- only restore if still the same penalty we applied
+                        if controller._activeTurn and controller._activeTurn.origDirectional == orig then
+                            restoreDirectionalPenalty()
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- If we failed to apply via DirectionalMovement, fallback to restoring AutoRotate immediately
+        if not applied then
+            pcall(function() if humanoid then humanoid.AutoRotate = info and info.savedAutoRotate end end)
+        end
+
+        if info and info.dieConn then
+            pcall(function() info.dieConn:Disconnect() end)
+        end
+    end)
+end
+
+-- Face override: snap to survivor, hold orientation, and apply directional penalty immediately
+local function performFaceOverride(survivor)
+    if not isPlayingKiller() then return end
+    if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
+    lastDodgeTime = tick()
+    if not char or not hrp or not humanoid then return end
+    local sPos = getModelPosition(survivor)
+    if not sPos then return end
+
+    -- Cleanup any active override first
+    interruptActiveOverrides()
+
+    -- Save and disable AutoRotate
+    local savedAutoRotate = humanoid.AutoRotate
+    humanoid.AutoRotate = false
+
+    -- Attempt to apply a directional multiplier penalty immediately (based on current value)
+    local applied = false
+    local folder = getMySpeedMultipliersFolder()
+    if folder then
+        local dirVal = folder:FindFirstChild("DirectionalMovement")
+        if dirVal and (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then
+            local orig = dirVal.Value or 1
+            local newVal = math.max(0.01, orig * (1 - TURN_SPEED_REDUCTION))
+            applied = applyDirectionalPenalty(newVal)
+            -- register dieConn so we can restore on death
+            if applied and controller._activeTurn and controller._activeTurn.dirVal then
+                -- we'll reuse the face dieConn below to disconnect
+            end
+        end
+    end
+
+    -- Compute look CFrame (preserve hrp Y for level look)
+    local lookPos = Vector3.new(sPos.X, hrp.Position.Y, sPos.Z)
+    local targetCFrame = CFrame.new(hrp.Position, lookPos)
+
+    -- Instant snap and zero RotVelocity
+    pcall(function()
+        hrp.CFrame = targetCFrame
+        if hrp:IsA("BasePart") then
+            hrp.RotVelocity = Vector3.new(0,0,0)
+        end
+    end)
+
+    -- Backup BodyGyro (not relied on for snapping)
+    local bg = Instance.new("BodyGyro")
+    bg.Name = "AutoReflexFaceGyro"
+    bg.MaxTorque = Vector3.new(1e8, 1e8, 1e8)
+    bg.P = 1e6
+    bg.D = 1
+    bg.CFrame = targetCFrame
+    bg.Parent = hrp
+
+    -- Heartbeat forcing to hold exact orientation
+    local hbConn
+    hbConn = RunService.Heartbeat:Connect(function()
+        if not controller._activeFace then
+            if hbConn then pcall(function() hbConn:Disconnect() end) end
+            return
+        end
+        if hrp and hrp.Parent then
+            local pos = hrp.Position
+            local fixed = CFrame.new(pos, lookPos)
+            hrp.CFrame = fixed
+        end
+    end)
+
+    local dieConn
+    dieConn = humanoid.Died:Connect(function()
+        if bg and bg.Parent then
+            pcall(function() bg:Destroy() end)
+        end
+        if hbConn then
+            pcall(function() hbConn:Disconnect() end)
+        end
+        if dieConn then
+            pcall(function() dieConn:Disconnect() end)
+        end
+        -- restore directional multiplier on death
+        restoreDirectionalPenalty()
+    end)
+
+    controller._activeFace = {
+        bg = bg,
+        hbConn = hbConn,
+        savedAutoRotate = savedAutoRotate,
+        dieConn = dieConn
+    }
+
+    -- If we applied a directional penalty, attach dieConn reference so it gets restored on death
+    if controller._activeTurn and controller._activeTurn.dirVal then
+        controller._activeTurn.dirDieConn = dieConn
+    end
+
+    if ENABLE_AUTO_KILL_PREVIOUS then
+        killPreviousController()
+    end
+
+    delay(FACE_OVERRIDE_DURATION, function()
+        if not controller._activeFace then return end
+        local info = controller._activeFace
+        controller._activeFace = nil
+        if info.bg and info.bg.Parent then
+            pcall(function() info.bg:Destroy() end)
+        end
+        if info.hbConn then
+            pcall(function() info.hbConn:Disconnect() end)
+        end
+        if humanoid then
+            pcall(function() humanoid.AutoRotate = info.savedAutoRotate end)
+        end
+        if info.dieConn then
+            pcall(function() info.dieConn:Disconnect() end)
+        end
+
+        -- schedule restore of the directional multiplier (if we changed it)
+        if controller._activeTurn and controller._activeTurn.origDirectional then
+            local orig = controller._activeTurn.origDirectional
+            delay(TURN_PENALTY_DURATION, function()
+                if controller._activeTurn and controller._activeTurn.origDirectional == orig then
+                    restoreDirectionalPenalty()
+                end
+            end)
+        else
+            -- nothing to restore via directional multiplier
+            restoreDirectionalPenalty()
+        end
+    end)
+end
+
+
+
+local function onResistanceValueChanged(resVal)
+    if not resVal then return end
+    local v = tonumber(resVal.Value) or 0
+    if not TRIGGER_VALUES[v] then return end
+    if not isPlayingKiller() then return end
+    local mapping = watchedValues[resVal]
+    local survivor = mapping and mapping.survivor
+    if not survivor then
+        if resVal.Parent and resVal.Parent.Parent then
+            survivor = resVal.Parent.Parent
+        end
+    end
+    if not survivor then
+        return
+    end
+    local sPos = getModelPosition(survivor)
+    if not sPos then return end
+    if not hrp then
+        local c = LocalPlayer.Character
+        if c then hrp = c:FindFirstChild("HumanoidRootPart") end
+        if not hrp then return end
+    end
+    local dist = (hrp.Position - sPos).Magnitude
+    if dist <= DODGE_RANGE then
+        -- For specific survivors we vary the dodge type. TwoTime triggers a face
+        -- override; JaneDoe triggers a back dodge only when the resistance value is 20;
+        -- all others trigger a back dodge as before.
+        if survivor.Name == "TwoTime" then
+            performFaceOverride(survivor)
+        elseif survivor.Name == "JaneDoe" then
+            -- Only dodge for JaneDoe when the resistance value equals 20
+            if v == 20 then
+                performBackDodgeOverride()
+            end
+        else
+            performBackDodgeOverride()
+        end
+    end
+end
+
+local function watchSurvivor(survivor)
+    if not survivor or not TARGET_NAMES[survivor.Name] then return end
+    local folder = survivor:FindFirstChild(RESISTANCE_FOLDER_NAME)
+    if folder then
+        local val = folder:FindFirstChild(RESISTANCE_VALUE_NAME)
+        if val and (val:IsA("IntValue") or val:IsA("NumberValue")) then
+            if not watchedValues[val] then
+                local conn = val:GetPropertyChangedSignal("Value"):Connect(function() onResistanceValueChanged(val) end)
+                watchedValues[val] = { conn = conn, survivor = survivor }
+                connections[#connections+1] = conn
+                onResistanceValueChanged(val)
+            end
+        else
+            local conn2 = folder.ChildAdded:Connect(function(child)
+                if not running then return end
+                if child.Name == RESISTANCE_VALUE_NAME and (child:IsA("IntValue") or child:IsA("NumberValue")) then
+                    if not watchedValues[child] then
+                        local conn = child:GetPropertyChangedSignal("Value"):Connect(function() onResistanceValueChanged(child) end)
+                        watchedValues[child] = { conn = conn, survivor = survivor }
+                        connections[#connections+1] = conn
+                        onResistanceValueChanged(child)
+                    end
+                end
+            end)
+            connections[#connections+1] = conn2
+        end
+    else
+        local c = survivor.ChildAdded:Connect(function(child)
+            if not running then return end
+            if child.Name == RESISTANCE_FOLDER_NAME then
+                delay(0.03, function() watchSurvivor(survivor) end)
+            end
+        end)
+        connections[#connections+1] = c
+    end
+end
+
+local function scanAndWatchSurvivors()
+    local survivorsFolder = findSurvivorsFolder()
+    if not survivorsFolder then return end
+    for _, child in ipairs(survivorsFolder:GetChildren()) do
+        pcall(function() watchSurvivor(child) end)
+    end
+    local connAdd = survivorsFolder.ChildAdded:Connect(function(child)
+        if not running then return end
+        pcall(function() watchSurvivor(child) end)
+    end)
+    connections[#connections+1] = connAdd
+end
+
+connections[#connections+1] = UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == KILL_HOTKEY then
+        killPreviousController()
+    end
+end)
+
+locateAndWatchSprintValue()
+do
+    local node = workspace:FindFirstChild("Players")
+    if node then
+        local killers = node:FindFirstChild("Killers")
+        if killers then
+            local conn = killers.ChildAdded:Connect(function()
+                if not running then return end
+                delay(0.05, locateAndWatchSprintValue)
+            end)
+            connections[#connections+1] = conn
+        end
+        local conn2 = node.ChildAdded:Connect(function()
+            if not running then return end
+            if node:FindFirstChild("Killers") then
+                delay(0.05, locateAndWatchSprintValue)
+            end
+        end)
+        connections[#connections+1] = conn2
+    else
+        local conn = workspace.ChildAdded:Connect(function(child)
+            if not running then return end
+            if child.Name == "Players" then
+                delay(0.05, locateAndWatchSprintValue)
+            end
+        end)
+        connections[#connections+1] = conn
+    end
+end
+
+local function onAnimationPlayed(track)
+    if not track or not track.Animation then return end
+    local animId = tostring(track.Animation.AnimationId or "")
+    local idNum = animId:match("(%d+)")
+    if not idNum then return end
+    if WATCHED_ANIM_IDS[tostring(idNum)] then
+        interruptActiveOverrides()
+    end
+end
+
+local function onCharacterAdded(c)
+    char = c
+    humanoid = char:FindFirstChildOfClass("Humanoid")
+    hrp = char:FindFirstChild("HumanoidRootPart")
+    if not humanoid then humanoid = char:WaitForChild("Humanoid", 2) end
+    if not hrp then hrp = char:WaitForChild("HumanoidRootPart", 2) end
+    delay(0.05, locateAndWatchSprintValue)
+    pcall(function()
+        if animatorConnection then
+            pcall(function() animatorConnection:Disconnect() end)
+            animatorConnection = nil
+        end
+        local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid:WaitForChild("Animator", 1)
+        if animator then
+            animatorConnection = animator.AnimationPlayed:Connect(onAnimationPlayed)
+            connections[#connections+1] = animatorConnection
+        end
+    end)
+end
+if LocalPlayer.Character then onCharacterAdded(LocalPlayer.Character) end
+connections[#connections+1] = LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+
+scanAndWatchSurvivors()
+
+local function cleanup()
+    running = false
+    for _, conn in ipairs(connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    connections = {}
+    for val, info in pairs(watchedValues) do
+        if info and info.conn then
+            pcall(function() info.conn:Disconnect() end)
+        end
+    end
+    watchedValues = {}
+    if sprintValueInstance and sprintValueInstance._conn then
+        pcall(function() sprintValueInstance._conn:Disconnect() end)
+        sprintValueInstance._conn = nil
+    end
+    sprintValueInstance = nil
+    if animatorConnection then
+        pcall(function() animatorConnection:Disconnect() end)
+        animatorConnection = nil
+    end
+    interruptActiveOverrides()
+    if _G.AutoReflexController == controller then _G.AutoReflexController = nil end
+    controller.Cleanup = nil
+end
+controller.Cleanup = cleanup
+
+function controller.KillPrevious()
+    killPreviousController()
+end
+function controller.TriggerDodgeNow()
+    performBackDodgeOverride()
+end
+
+if RunService:IsStudio() then
+    warn("[AutoReflex_SpeedAware_0.14sOverride_Range] running. Press 'K' to kill previous controller. Dodge override duration:", DODGE_OVERRIDE_DURATION, "Range:", DODGE_RANGE)
+end
+end
