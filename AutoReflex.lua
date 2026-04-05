@@ -8,7 +8,14 @@ local LocalPlayer = PlayersService.LocalPlayer
 if not LocalPlayer then return end
 
 local SURVIVORS_PATH = {"Players", "Survivors"}
-local TARGET_NAMES = { Guest1337 = true, Shedletsky = true, TwoTime = true, JaneDoe = true }
+local TARGET_NAMES = {
+    Guest1337 = true,
+    Shedletsky = true,
+    TwoTime = true,
+    JaneDoe = true,
+    Chance = true,
+}
+
 local RESISTANCE_FOLDER_NAME = "ResistanceMultipliers"
 local RESISTANCE_VALUE_NAME = "ResistanceStatus"
 local TRIGGER_VALUES = { [20] = true, [40] = true }
@@ -20,14 +27,24 @@ local DODGE_FORCE_P = 1e4
 local DODGE_FORCE_MAX = Vector3.new(1e5, 1e5, 1e5)
 local DODGE_MAX_SPEED = 19
 
+local DODGE_OBSTACLE_CHECK_DISTANCE = 5
+local CHANCE_SECONDARY_WEIGHT = 0.75
+
+-- Separate dodge delays per survivor
+local DODGE_DELAYS = {
+    Shedletsky = 0.12,
+    JaneDoe = 0.2,
+    Chance = 0.20,
+}
+
 -- Separate dodge durations per survivor
 local DODGE_DURATIONS = {
     Default = 0.35,
     Shedletsky = 0.35,
-    JaneDoe = 0.5, -- longer dodge for JaneDoe
+    JaneDoe = 0.20,
+    Chance = 0.20,
 }
 
--- Face duration
 local FACE_OVERRIDE_DURATION = 0.5
 
 local ENABLE_AUTO_KILL_PREVIOUS = true
@@ -60,6 +77,7 @@ local WATCHED_ANIM_IDS = {
 local running = true
 local connections = {}
 local watchedValues = {}
+local watchedChanceObjects = {}
 local lastDodgeTime = 0
 local char, hrp, humanoid = nil, nil, nil
 local sprintValueInstance = nil
@@ -85,18 +103,27 @@ local function findSurvivorsFolder()
     return safeFind(SURVIVORS_PATH)
 end
 
-local function getModelPosition(model)
+local function getModelRootPart(model)
     if not model then return nil end
     if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
-        return model.PrimaryPart.Position
+        return model.PrimaryPart
     end
     local candidates = {"HumanoidRootPart", "Torso", "UpperTorso", "LowerTorso"}
     for _, name in ipairs(candidates) do
         local p = model:FindFirstChild(name)
         if p and p:IsA("BasePart") then
-            return p.Position
+            return p
         end
     end
+    return nil
+end
+
+local function getModelPosition(model)
+    local root = getModelRootPart(model)
+    if root then
+        return root.Position
+    end
+    if not model then return nil end
     local sum = Vector3.new(0,0,0)
     local count = 0
     for _, desc in ipairs(model:GetDescendants()) do
@@ -109,6 +136,21 @@ local function getModelPosition(model)
         return sum / count
     end
     return nil
+end
+
+local function getHorizontalUnit(vec)
+    local flat = Vector3.new(vec.X, 0, vec.Z)
+    if flat.Magnitude < 0.001 then
+        return nil
+    end
+    return flat.Unit
+end
+
+local function getDodgeDurationForSurvivor(name)
+    if name and DODGE_DURATIONS[name] then
+        return DODGE_DURATIONS[name]
+    end
+    return DODGE_DURATIONS.Default
 end
 
 local function killPreviousController()
@@ -129,6 +171,7 @@ local function locateAndWatchSprintValue()
     end
     sprintValueInstance = nil
     currentSprintMultiplier = 1
+
     local playersNode = workspace:FindFirstChild("Players")
     if not playersNode then return end
     local killersFolder = playersNode:FindFirstChild("Killers")
@@ -145,6 +188,7 @@ local function locateAndWatchSprintValue()
         connections[#connections+1] = conn
         return
     end
+
     local speedMultFolder = myKillerEntry:FindFirstChild("SpeedMultipliers")
     if not speedMultFolder then
         local conn = myKillerEntry.ChildAdded:Connect(function(child)
@@ -156,6 +200,7 @@ local function locateAndWatchSprintValue()
         connections[#connections+1] = conn
         return
     end
+
     local sprintVal = speedMultFolder:FindFirstChild("Sprinting")
     if sprintVal and (sprintVal:IsA("NumberValue") or sprintVal:IsA("IntValue")) then
         sprintValueInstance = sprintVal
@@ -209,21 +254,6 @@ end
 local TURN_SPEED_REDUCTION = 0.30
 local TURN_PENALTY_DURATION = 0.5
 
-local function clearTurnPenalty()
-    if controller._activeTurn then
-        local tinfo = controller._activeTurn
-        controller._activeTurn = nil
-        pcall(function()
-            if humanoid and tinfo.savedWalkSpeed then
-                humanoid.WalkSpeed = tinfo.savedWalkSpeed
-            end
-        end)
-        if tinfo.dieConn then
-            pcall(function() tinfo.dieConn:Disconnect() end)
-        end
-    end
-end
-
 local function getMySpeedMultipliersFolder()
     local playersNode = workspace:FindFirstChild("Players")
     if not playersNode then return nil end
@@ -231,8 +261,7 @@ local function getMySpeedMultipliersFolder()
     if not killersFolder then return nil end
     local myEntry = killersFolder:FindFirstChild(LocalPlayer.Name)
     if not myEntry then return nil end
-    local speedMultFolder = myEntry:FindFirstChild("SpeedMultipliers")
-    return speedMultFolder
+    return myEntry:FindFirstChild("SpeedMultipliers")
 end
 
 local function applyDirectionalPenalty(multipliedValue)
@@ -250,7 +279,6 @@ local function applyDirectionalPenalty(multipliedValue)
     end
     controller._activeTurn.dirVal = dirVal
     controller._activeTurn.origDirectional = orig
-
     return true
 end
 
@@ -309,37 +337,179 @@ local function interruptActiveOverrides()
     restoreDirectionalPenalty()
 end
 
-local function getDodgeDurationForSurvivor(survivorName)
-    if survivorName and DODGE_DURATIONS[survivorName] then
-        return DODGE_DURATIONS[survivorName]
-    end
-    return DODGE_DURATIONS.Default
+local function buildRayParams()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = {char}
+    params.IgnoreWater = true
+    return params
 end
 
-local function performBackDodgeOverride(dodgeDuration)
-    if not isPlayingKiller() then return end
-    if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
-    lastDodgeTime = tick()
-    if not char or not hrp or not humanoid then return end
+local function getCardinalDirections()
+    if not hrp then return nil end
+    local forward = getHorizontalUnit(hrp.CFrame.LookVector)
+    local right = getHorizontalUnit(hrp.CFrame.RightVector)
+    if not forward or not right then return nil end
+    return {
+        Forward = forward,
+        Backward = -forward,
+        Right = right,
+        Left = -right,
+    }
+end
 
-    dodgeDuration = tonumber(dodgeDuration) or DODGE_DURATIONS.Default
+local function isDirectionBlocked(dir)
+    if not hrp then return true end
+    local params = buildRayParams()
+    local hit = workspace:Raycast(hrp.Position, dir * DODGE_OBSTACLE_CHECK_DISTANCE, params)
+    return hit ~= nil
+end
+
+local function getSurvivorFacingDir(survivor)
+    local root = getModelRootPart(survivor)
+    if not root then return nil end
+    return getHorizontalUnit(root.CFrame.LookVector)
+end
+
+local function getSurvivorRelativeDir(survivor)
+    local sPos = getModelPosition(survivor)
+    if not sPos or not hrp then return nil end
+    return getHorizontalUnit(sPos - hrp.Position)
+end
+
+local function scoreDodgeDirection(survivor, dir)
+    local score = 0
+
+    if isDirectionBlocked(dir) then
+        score = score + 1000
+    end
+
+    local relDir = getSurvivorRelativeDir(survivor)
+    local facingDir = getSurvivorFacingDir(survivor)
+
+    if relDir then
+        local towardSurvivor = relDir:Dot(dir)
+        if towardSurvivor > 0 then
+            score = score + towardSurvivor * 220
+        else
+            score = score + towardSurvivor * 20
+        end
+    end
+
+    if facingDir then
+        local alignment = math.abs(facingDir:Dot(dir))
+        score = score + alignment * 260
+
+        local intoFacing = facingDir:Dot(dir)
+        if intoFacing > 0 then
+            score = score + intoFacing * 140
+        end
+    end
+
+    if relDir and facingDir then
+        local positionPressure = math.max(0, relDir:Dot(dir))
+        local facingPressure = math.abs(facingDir:Dot(dir))
+        score = score + (positionPressure * facingPressure) * 120
+    end
+
+    return score
+end
+
+local function chooseBestAdaptiveDirection(survivor, allowedNames)
+    local dirs = getCardinalDirections()
+    if not dirs then return nil end
+
+    local candidates = {}
+    if allowedNames then
+        for _, name in ipairs(allowedNames) do
+            if dirs[name] then
+                table.insert(candidates, {name = name, dir = dirs[name]})
+            end
+        end
+    else
+        for name, dir in pairs(dirs) do
+            table.insert(candidates, {name = name, dir = dir})
+        end
+    end
+
+    local best = nil
+    local bestScore = math.huge
+
+    for _, entry in ipairs(candidates) do
+        local s = scoreDodgeDirection(survivor, entry.dir)
+        if s < bestScore then
+            bestScore = s
+            best = entry
+        end
+    end
+
+    return best
+end
+
+local function chooseBestPerpendicularDirection(survivor, primaryName)
+    if primaryName == "Left" or primaryName == "Right" then
+        return chooseBestAdaptiveDirection(survivor, {"Forward", "Backward"})
+    elseif primaryName == "Forward" or primaryName == "Backward" then
+        return chooseBestAdaptiveDirection(survivor, {"Left", "Right"})
+    end
+    return nil
+end
+
+local function applyPostDodgePenalty(info)
+    local applied = false
+    local folder = getMySpeedMultipliersFolder()
+    if folder then
+        local dirVal = folder:FindFirstChild("DirectionalMovement")
+        if dirVal and (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then
+            local orig = dirVal.Value or 1
+            local newVal = math.max(0.01, orig * (1 - TURN_SPEED_REDUCTION))
+            applied = applyDirectionalPenalty(newVal)
+            if applied and info and info.dieConn then
+                controller._activeTurn.dirDieConn = info.dieConn
+            end
+            if applied then
+                delay(TURN_PENALTY_DURATION, function()
+                    if controller._activeTurn and controller._activeTurn.origDirectional == orig then
+                        restoreDirectionalPenalty()
+                    end
+                end)
+            end
+        end
+    end
+
+    if not applied then
+        pcall(function()
+            if humanoid then
+                humanoid.AutoRotate = info and info.savedAutoRotate
+            end
+        end)
+    end
+
+    if info and info.dieConn then
+        pcall(function() info.dieConn:Disconnect() end)
+    end
+end
+
+local function performDirectionalDodge(moveVector, dodgeDuration)
+    if not isPlayingKiller() then return end
+    if not char or not hrp or not humanoid then return end
 
     local speed = getCurrentSpeed()
     if speed < MIN_SPEED_TO_TRIGGER then return end
     if DODGE_MAX_SPEED and type(DODGE_MAX_SPEED) == "number" then
         speed = math.min(speed, DODGE_MAX_SPEED)
     end
-    local back = -hrp.CFrame.LookVector
-    local backHoriz = Vector3.new(back.X, 0, back.Z)
-    if backHoriz.Magnitude < 0.001 then return end
-    backHoriz = backHoriz.Unit
-    local savedAutoRotate = humanoid.AutoRotate
 
+    local moveHoriz = getHorizontalUnit(moveVector)
+    if not moveHoriz then return end
+
+    local savedAutoRotate = humanoid.AutoRotate
     humanoid.AutoRotate = false
     humanoid.WalkSpeed = 0
 
     local bv = Instance.new("BodyVelocity")
-    bv.Name = "AutoReflexBackDodge"
+    bv.Name = "AutoReflexDirectionalDodge"
+
     local maxForceHoriz
     if typeof(DODGE_FORCE_MAX) == "Vector3" then
         maxForceHoriz = Vector3.new(DODGE_FORCE_MAX.X, 0, DODGE_FORCE_MAX.Z)
@@ -347,15 +517,17 @@ local function performBackDodgeOverride(dodgeDuration)
         local scalar = tonumber(DODGE_FORCE_MAX) or 1e5
         maxForceHoriz = Vector3.new(scalar, 0, scalar)
     end
+
     local preservedY = 0
     pcall(function()
         if hrp and hrp:IsA("BasePart") then
             preservedY = hrp.Velocity.Y or 0
         end
     end)
+
     bv.MaxForce = maxForceHoriz
     bv.P = DODGE_FORCE_P
-    bv.Velocity = Vector3.new(backHoriz.X * speed, preservedY, backHoriz.Z * speed)
+    bv.Velocity = Vector3.new(moveHoriz.X * speed, preservedY, moveHoriz.Z * speed)
     bv.Parent = hrp
 
     local dieConn
@@ -378,45 +550,76 @@ local function performBackDodgeOverride(dodgeDuration)
         killPreviousController()
     end
 
-    delay(dodgeDuration, function()
+    delay(tonumber(dodgeDuration) or DODGE_DURATIONS.Default, function()
         if not controller then return end
         local info = controller._activeDodge
         controller._activeDodge = nil
         if info and info.bv and info.bv.Parent then
             pcall(function() info.bv:Destroy() end)
         end
+        applyPostDodgePenalty(info)
+    end)
+end
 
-        local applied = false
-        local folder = getMySpeedMultipliersFolder()
-        if folder then
-            local dirVal = folder:FindFirstChild("DirectionalMovement")
-            if dirVal and (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then
-                local orig = dirVal.Value or 1
-                local newVal = math.max(0.01, orig * (1 - TURN_SPEED_REDUCTION))
-                applied = applyDirectionalPenalty(newVal)
-                if applied and info and info.dieConn then
-                    controller._activeTurn.dirDieConn = info.dieConn
-                end
-                if applied then
-                    delay(TURN_PENALTY_DURATION, function()
-                        if controller._activeTurn and controller._activeTurn.origDirectional == orig then
-                            restoreDirectionalPenalty()
-                        end
-                    end)
-                end
-            end
-        end
+local function performAdaptiveSingleDodge(survivor, dodgeDuration)
+    local best = chooseBestAdaptiveDirection(survivor)
+    if not best then return end
+    performDirectionalDodge(best.dir, dodgeDuration)
+end
 
-        if not applied then
-            pcall(function()
-                if humanoid then
-                    humanoid.AutoRotate = info and info.savedAutoRotate
-                end
-            end)
-        end
+local function performAdaptiveComboDodge(survivor, dodgeDuration)
+    local primary = chooseBestAdaptiveDirection(survivor)
+    if not primary then return end
 
-        if info and info.dieConn then
-            pcall(function() info.dieConn:Disconnect() end)
+    local secondary = chooseBestPerpendicularDirection(survivor, primary.name)
+    if secondary then
+        local combo = primary.dir + (secondary.dir * CHANCE_SECONDARY_WEIGHT)
+        performDirectionalDodge(combo, dodgeDuration)
+    else
+        performDirectionalDodge(primary.dir, dodgeDuration)
+    end
+end
+
+local function scheduleTrackedAdaptiveDodge(survivor, mode, delayTime, dodgeDuration)
+    if not survivor then return end
+    if not isPlayingKiller() then return end
+    if not hrp then
+        local c = LocalPlayer.Character
+        if c then hrp = c:FindFirstChild("HumanoidRootPart") end
+        if not hrp then return end
+    end
+
+    local sPos = getModelPosition(survivor)
+    if not sPos then return end
+    local dist = (hrp.Position - sPos).Magnitude
+    if dist > DODGE_RANGE then return end
+
+    if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
+    lastDodgeTime = tick()
+
+    local delayToUse = tonumber(delayTime) or 0
+    local durationToUse = tonumber(dodgeDuration) or DODGE_DURATIONS.Default
+    local token = tostring(tick()) .. "_" .. tostring(math.random(1000, 9999))
+    controller._pendingAdaptiveDodgeToken = token
+
+    delay(delayToUse, function()
+        if not running then return end
+        if controller._pendingAdaptiveDodgeToken ~= token then return end
+        controller._pendingAdaptiveDodgeToken = nil
+
+        if not survivor or not survivor.Parent then return end
+        if not isPlayingKiller() then return end
+        if not char or not hrp or not humanoid then return end
+
+        local latestPos = getModelPosition(survivor)
+        if not latestPos then return end
+        local latestDist = (hrp.Position - latestPos).Magnitude
+        if latestDist > DODGE_RANGE then return end
+
+        if mode == "combo" then
+            performAdaptiveComboDodge(survivor, durationToUse)
+        else
+            performAdaptiveSingleDodge(survivor, durationToUse)
         end
     end)
 end
@@ -425,6 +628,7 @@ local function performFaceOverride(survivor)
     if not isPlayingKiller() then return end
     if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
     lastDodgeTime = tick()
+
     if not char or not hrp or not humanoid then return end
     local sPos = getModelPosition(survivor)
     if not sPos then return end
@@ -434,14 +638,14 @@ local function performFaceOverride(survivor)
     local savedAutoRotate = humanoid.AutoRotate
     humanoid.AutoRotate = false
 
-    local applied = false
     local folder = getMySpeedMultipliersFolder()
     if folder then
         local dirVal = folder:FindFirstChild("DirectionalMovement")
         if dirVal and (dirVal:IsA("NumberValue") or dirVal:IsA("IntValue")) then
             local orig = dirVal.Value or 1
             local newVal = math.max(0.01, orig * (1 - TURN_SPEED_REDUCTION))
-            applied = applyDirectionalPenalty(newVal)
+            applyDirectionalPenalty(newVal)
+            controller._pendingFaceOrigDirectional = orig
         end
     end
 
@@ -548,12 +752,11 @@ local function onResistanceValueChanged(resVal)
             survivor = resVal.Parent.Parent
         end
     end
-    if not survivor then
-        return
-    end
+    if not survivor then return end
 
     local sPos = getModelPosition(survivor)
     if not sPos then return end
+
     if not hrp then
         local c = LocalPlayer.Character
         if c then hrp = c:FindFirstChild("HumanoidRootPart") end
@@ -565,25 +768,97 @@ local function onResistanceValueChanged(resVal)
         if survivor.Name == "TwoTime" then
             performFaceOverride(survivor)
         elseif survivor.Name == "JaneDoe" then
-            if v == 20 then
-                performBackDodgeOverride(getDodgeDurationForSurvivor("JaneDoe"))
-            end
+            scheduleTrackedAdaptiveDodge(
+                survivor,
+                "single",
+                DODGE_DELAYS.JaneDoe,
+                getDodgeDurationForSurvivor("JaneDoe")
+            )
         elseif survivor.Name == "Shedletsky" then
-            performBackDodgeOverride(getDodgeDurationForSurvivor("Shedletsky"))
+            scheduleTrackedAdaptiveDodge(
+                survivor,
+                "single",
+                DODGE_DELAYS.Shedletsky,
+                getDodgeDurationForSurvivor("Shedletsky")
+            )
         else
-            performBackDodgeOverride(getDodgeDurationForSurvivor(survivor.Name))
+            performDirectionalDodge(-hrp.CFrame.LookVector, getDodgeDurationForSurvivor(survivor.Name))
         end
+    end
+end
+
+local function triggerChanceShootingGunDodge(chanceSurvivor)
+    if not chanceSurvivor or chanceSurvivor.Name ~= "Chance" then return end
+    if not isPlayingKiller() then return end
+
+    local sPos = getModelPosition(chanceSurvivor)
+    if not sPos then return end
+
+    if not hrp then
+        local c = LocalPlayer.Character
+        if c then hrp = c:FindFirstChild("HumanoidRootPart") end
+        if not hrp then return end
+    end
+
+    local dist = (hrp.Position - sPos).Magnitude
+    if dist <= DODGE_RANGE then
+        scheduleTrackedAdaptiveDodge(
+            chanceSurvivor,
+            "combo",
+            DODGE_DELAYS.Chance,
+            getDodgeDurationForSurvivor("Chance")
+        )
+    end
+end
+
+local function watchChanceShootingGun(chanceSurvivor)
+    if not chanceSurvivor or chanceSurvivor.Name ~= "Chance" then return end
+
+    local speedFolder = chanceSurvivor:FindFirstChild("SpeedMultipliers")
+    if speedFolder then
+        local existing = speedFolder:FindFirstChild("ShootingGun")
+        if existing and not watchedChanceObjects[existing] then
+            watchedChanceObjects[existing] = true
+            triggerChanceShootingGunDodge(chanceSurvivor)
+        end
+
+        local conn = speedFolder.ChildAdded:Connect(function(child)
+            if not running then return end
+            if child.Name == "ShootingGun" and not watchedChanceObjects[child] then
+                watchedChanceObjects[child] = true
+                triggerChanceShootingGunDodge(chanceSurvivor)
+            end
+        end)
+        connections[#connections+1] = conn
+    else
+        local conn2 = chanceSurvivor.ChildAdded:Connect(function(child)
+            if not running then return end
+            if child.Name == "SpeedMultipliers" then
+                delay(0.03, function()
+                    watchChanceShootingGun(chanceSurvivor)
+                end)
+            end
+        end)
+        connections[#connections+1] = conn2
     end
 end
 
 local function watchSurvivor(survivor)
     if not survivor or not TARGET_NAMES[survivor.Name] then return end
+
+    if survivor.Name == "Chance" then
+        watchChanceShootingGun(survivor)
+        return
+    end
+
     local folder = survivor:FindFirstChild(RESISTANCE_FOLDER_NAME)
     if folder then
         local val = folder:FindFirstChild(RESISTANCE_VALUE_NAME)
         if val and (val:IsA("IntValue") or val:IsA("NumberValue")) then
             if not watchedValues[val] then
-                local conn = val:GetPropertyChangedSignal("Value"):Connect(function() onResistanceValueChanged(val) end)
+                local conn = val:GetPropertyChangedSignal("Value"):Connect(function()
+                    onResistanceValueChanged(val)
+                end)
                 watchedValues[val] = { conn = conn, survivor = survivor }
                 connections[#connections+1] = conn
                 onResistanceValueChanged(val)
@@ -593,7 +868,9 @@ local function watchSurvivor(survivor)
                 if not running then return end
                 if child.Name == RESISTANCE_VALUE_NAME and (child:IsA("IntValue") or child:IsA("NumberValue")) then
                     if not watchedValues[child] then
-                        local conn = child:GetPropertyChangedSignal("Value"):Connect(function() onResistanceValueChanged(child) end)
+                        local conn = child:GetPropertyChangedSignal("Value"):Connect(function()
+                            onResistanceValueChanged(child)
+                        end)
                         watchedValues[child] = { conn = conn, survivor = survivor }
                         connections[#connections+1] = conn
                         onResistanceValueChanged(child)
@@ -679,7 +956,9 @@ local function onCharacterAdded(c)
     hrp = char:FindFirstChild("HumanoidRootPart")
     if not humanoid then humanoid = char:WaitForChild("Humanoid", 2) end
     if not hrp then hrp = char:WaitForChild("HumanoidRootPart", 2) end
+
     delay(0.05, locateAndWatchSprintValue)
+
     pcall(function()
         if animatorConnection then
             pcall(function() animatorConnection:Disconnect() end)
@@ -692,7 +971,10 @@ local function onCharacterAdded(c)
         end
     end)
 end
-if LocalPlayer.Character then onCharacterAdded(LocalPlayer.Character) end
+
+if LocalPlayer.Character then
+    onCharacterAdded(LocalPlayer.Character)
+end
 connections[#connections+1] = LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
 
 scanAndWatchSurvivors()
@@ -703,23 +985,32 @@ local function cleanup()
         pcall(function() conn:Disconnect() end)
     end
     connections = {}
+
     for val, info in pairs(watchedValues) do
         if info and info.conn then
             pcall(function() info.conn:Disconnect() end)
         end
     end
     watchedValues = {}
+    watchedChanceObjects = {}
+    controller._pendingAdaptiveDodgeToken = nil
+
     if sprintValueInstance and sprintValueInstance._conn then
         pcall(function() sprintValueInstance._conn:Disconnect() end)
         sprintValueInstance._conn = nil
     end
     sprintValueInstance = nil
+
     if animatorConnection then
         pcall(function() animatorConnection:Disconnect() end)
         animatorConnection = nil
     end
+
     interruptActiveOverrides()
-    if _G.AutoReflexController == controller then _G.AutoReflexController = nil end
+
+    if _G.AutoReflexController == controller then
+        _G.AutoReflexController = nil
+    end
     controller.Cleanup = nil
 end
 controller.Cleanup = cleanup
@@ -729,14 +1020,18 @@ function controller.KillPrevious()
 end
 
 function controller.TriggerDodgeNow()
-    performBackDodgeOverride(DODGE_DURATIONS.Default)
+    performDirectionalDodge(-hrp.CFrame.LookVector, DODGE_DURATIONS.Default)
 end
 
 if RunService:IsStudio() then
     warn(
-        "[AutoReflex_SpeedAware_CustomDurations] running. Press 'K' to kill previous controller.",
-        "JaneDoe Dodge:", DODGE_DURATIONS.JaneDoe,
-        "Shedletsky Dodge:", DODGE_DURATIONS.Shedletsky,
+        "[AutoReflex_AdaptiveSeparateDurations] running. Press 'K' to kill previous controller.",
+        "Shed delay:", DODGE_DELAYS.Shedletsky,
+        "Jane delay:", DODGE_DELAYS.JaneDoe,
+        "Chance delay:", DODGE_DELAYS.Chance,
+        "Shed duration:", DODGE_DURATIONS.Shedletsky,
+        "Jane duration:", DODGE_DURATIONS.JaneDoe,
+        "Chance duration:", DODGE_DURATIONS.Chance,
         "Range:", DODGE_RANGE
     )
 end
