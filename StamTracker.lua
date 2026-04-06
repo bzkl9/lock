@@ -26,7 +26,7 @@ local RUN_ANIM_IDS = {
 
 
 local BILLBOARD_SIZE = UDim2.new(1.6, 0, 0.9, 0)
-local BILLBOARD_OFFSET = Vector3.new(0, 3.0, 0)
+local BILLBOARD_OFFSET = Vector3.new(0, -1.5, 0)
 local LABEL_TEXTSCALED = false
 local LABEL_TEXTSIZE = 32
 local LABEL_FONT = Enum.Font.SourceSansBold
@@ -450,4 +450,3 @@ end)
 _G.StaminaTrackerController.cleanup = cleanupAll
 
 print("[StaminaTracker] Server script loaded ￯﾿ﾢ￯ﾾﾀ￯ﾾﾔ animation-based detection active with rest/empty timers.")
-
