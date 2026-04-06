@@ -126,6 +126,7 @@ Supported TriggerType values in this version:
 	"AnimationPlayed"
 	"ResistanceValueEquals"
 	"AttributeBoolTrue"
+	"AttributeNumberEquals"
 	"AttributeGroupEnds"
 	"AttributeIncreaseExcludingMove"
 
@@ -140,6 +141,11 @@ ResistanceValueEquals:
 AttributeBoolTrue:
 	AttributeName = "SomeBoolAttribute"
 	Starts cooldown when that model attribute becomes true.
+
+AttributeNumberEquals:
+	AttributeName = "SomeNumberAttribute"
+	ExpectedValue = number
+	Starts cooldown when that model attribute becomes the expected number.
 
 AttributeGroupEnds:
 	AttributeNames = { "Attr1", "Attr2", ... }
@@ -167,10 +173,9 @@ local SURVIVOR_CONFIGS = {
 			{
 				Label = "Block",
 				Cooldown = 30,
-				TriggerType = "ResistanceValueEquals",
-				FolderName = "ResistanceMultipliers",
-				ValueObjectName = "ResistanceStatus",
-				ExpectedValue = 100,
+				TriggerType = "AttributeNumberEquals",
+				AttributeName = "HitboxPriority",
+				ExpectedValue = 3,
 			},
 			{
 				Label = "Charge",
@@ -432,7 +437,6 @@ local function getHeadPart(model)
 
 	return nil
 end
-
 
 local function getHumanoid(model)
 	if not model then
@@ -825,6 +829,7 @@ function Tracker.new(config, survivorModel)
 
 			ResistanceLatched = false,
 			BoolAttrLatched = false,
+			NumberAttrLatched = false,
 			GroupWasActive = false,
 
 			LastAttributeValue = nil,
@@ -1141,6 +1146,23 @@ function Tracker:EvaluateAttributeBoolTrueMoves()
 	end
 end
 
+function Tracker:EvaluateAttributeNumberEqualsMoves()
+	for _, moveDef in ipairs(self.Config.Moves) do
+		if moveDef.TriggerType == "AttributeNumberEquals" then
+			local moveState = self.MoveStates[moveDef.Label]
+			local currentValue = readModelAttributeNumber(self.Survivor, moveDef.AttributeName)
+			local matched = currentValue ~= nil and currentValue == tonumber(moveDef.ExpectedValue)
+
+			if matched and not moveState.NumberAttrLatched then
+				self:StartCooldown(moveDef.Label)
+				moveState.NumberAttrLatched = true
+			elseif not matched then
+				moveState.NumberAttrLatched = false
+			end
+		end
+	end
+end
+
 function Tracker:EvaluateAttributeGroupEndMoves()
 	for _, moveDef in ipairs(self.Config.Moves) do
 		if moveDef.TriggerType == "AttributeGroupEnds" then
@@ -1324,6 +1346,7 @@ function Tracker:Update()
 
 	self:EvaluateResistanceMoves()
 	self:EvaluateAttributeBoolTrueMoves()
+	self:EvaluateAttributeNumberEqualsMoves()
 	self:EvaluateAttributeGroupEndMoves()
 	self:EvaluateAttributeIncreaseMoves()
 	self:ProcessPendingAttributeIncreaseMoves()
