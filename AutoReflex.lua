@@ -32,9 +32,9 @@ local CHANCE_SECONDARY_WEIGHT = 0.75
 
 -- Separate dodge delays per survivor
 local DODGE_DELAYS = {
-    Shedletsky = 0.12,
-    JaneDoe = 0.2,
-    Chance = 0.20,
+    Shedletsky = 0,
+    JaneDoe = 0,
+    Chance = 0,
 }
 
 -- Separate dodge durations per survivor
