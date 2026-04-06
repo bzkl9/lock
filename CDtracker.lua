@@ -82,9 +82,9 @@ local SURVIVORS_PATH = {"Players", "Survivors"}
 local RESISTANCE_FOLDER_NAME = "ResistanceMultipliers"
 local BILLBOARD_NAME_PREFIX = "CDTracker_"
 
-local BOX_WORLD_SIZE = 2.5
+local BOX_WORLD_SIZE = 2.2
 local BOX_WORLD_GAP = 0.08
-local HEAD_GAP_STUDS = 0.12
+local HEAD_GAP_STUDS = 0.7
 local MAX_DISTANCE = 200
 
 local READY_TOP = Color3.fromRGB(58, 126, 255)
