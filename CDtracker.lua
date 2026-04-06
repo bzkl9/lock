@@ -84,7 +84,7 @@ local BILLBOARD_NAME_PREFIX = "CDTracker_"
 
 local BOX_WORLD_SIZE = 3.5
 local BOX_WORLD_GAP = 0.08
-local HEAD_GAP_STUDS = 1
+local HEAD_GAP_STUDS = 2
 local MAX_DISTANCE = 200
 
 local READY_TOP = Color3.fromRGB(58, 126, 255)
