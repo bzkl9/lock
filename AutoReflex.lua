@@ -561,8 +561,8 @@ local function performDirectionalDodge(moveVector, dodgeDuration)
     end)
 end
 
-local function performAdaptiveSingleDodge(survivor, dodgeDuration)
-    local best = chooseBestAdaptiveDirection(survivor)
+local function performAdaptiveSingleDodge(survivor, dodgeDuration, allowedNames)
+    local best = chooseBestAdaptiveDirection(survivor, allowedNames)
     if not best then return end
     performDirectionalDodge(best.dir, dodgeDuration)
 end
@@ -580,7 +580,7 @@ local function performAdaptiveComboDodge(survivor, dodgeDuration)
     end
 end
 
-local function scheduleTrackedAdaptiveDodge(survivor, mode, delayTime, dodgeDuration)
+local function scheduleTrackedAdaptiveDodge(survivor, mode, delayTime, dodgeDuration, allowedNames)
     if not survivor then return end
     if not isPlayingKiller() then return end
     if not hrp then
@@ -619,7 +619,7 @@ local function scheduleTrackedAdaptiveDodge(survivor, mode, delayTime, dodgeDura
         if mode == "combo" then
             performAdaptiveComboDodge(survivor, durationToUse)
         else
-            performAdaptiveSingleDodge(survivor, durationToUse)
+            performAdaptiveSingleDodge(survivor, durationToUse, allowedNames)
         end
     end)
 end
@@ -779,7 +779,8 @@ local function onResistanceValueChanged(resVal)
                 survivor,
                 "single",
                 DODGE_DELAYS.Shedletsky,
-                getDodgeDurationForSurvivor("Shedletsky")
+                getDodgeDurationForSurvivor("Shedletsky"),
+                {"Forward", "Backward"}
             )
         else
             performDirectionalDodge(-hrp.CFrame.LookVector, getDodgeDurationForSurvivor(survivor.Name))
