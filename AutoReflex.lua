@@ -40,9 +40,9 @@ local DODGE_DELAYS = {
 -- Separate dodge durations per survivor
 local DODGE_DURATIONS = {
     Default = 0.35,
-    Shedletsky = 0.35,
-    JaneDoe = 0.20,
-    Chance = 0.20,
+    Shedletsky = 0.5,
+    JaneDoe = 0.50,
+    Chance = 0.50,
 }
 
 local FACE_OVERRIDE_DURATION = 0.5
