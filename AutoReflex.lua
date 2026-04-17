@@ -1,13 +1,13 @@
 do
 local RunService = game:GetService("RunService")
 local PlayersService = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = PlayersService.LocalPlayer
 if not LocalPlayer then return end
 
 local SURVIVORS_PATH = {"Players", "Survivors"}
-
 local TARGET_NAMES = {
 	Guest1337 = true,
 	Shedletsky = true,
@@ -18,32 +18,32 @@ local TARGET_NAMES = {
 
 local RESISTANCE_FOLDER_NAME = "ResistanceMultipliers"
 local RESISTANCE_VALUE_NAME = "ResistanceStatus"
-
-local TRIGGER_VALUES = {
-	[20] = true,
-	[40] = true,
-}
+local TRIGGER_VALUES = { [20] = true, [40] = true }
 
 local DODGE_COOLDOWN = 0.5
-local DODGE_RANGE = 9999
+local DODGE_RANGE = 28
 local MIN_SPEED_TO_TRIGGER = 0.2
 local DODGE_FORCE_P = 1e4
-local DODGE_FORCE_MAX = Vector3.new(1e5, 0, 1e5)
-local DODGE_MAX_SPEED = 21
-local POLL_INTERVAL = 0.03
+local DODGE_FORCE_MAX = Vector3.new(1e5, 1e5, 1e5)
+local DODGE_MAX_SPEED = 19
 
+-- Separate dodge delays per survivor
 local DODGE_DELAYS = {
 	Shedletsky = 0,
 	JaneDoe = 0,
 	Chance = 0,
 }
 
+-- Separate dodge durations per survivor
 local DODGE_DURATIONS = {
 	Default = 0.35,
 	Shedletsky = 0.5,
-	JaneDoe = 0.5,
-	Chance = 0.5,
+	JaneDoe = 0.50,
+	Chance = 0.50,
 }
+
+local ENABLE_AUTO_KILL_PREVIOUS = true
+local KILL_HOTKEY = Enum.KeyCode.K
 
 local NO_DODGE_SPEED_MULTIPLIERS = {
 	Entanglement = true,
@@ -66,41 +66,28 @@ local NO_DODGE_SPEED_MULTIPLIERS = {
 	["666BloodHuntStart"] = true,
 }
 
-local ENABLE_AUTO_KILL_PREVIOUS = true
-local DEBUG = true
-
 local running = true
 local connections = {}
-
-local char = nil
-local hrp = nil
-local humanoid = nil
-
+local watchedValues = {}
+local watchedChanceObjects = {}
+local lastDodgeTime = 0
+local char, hrp, humanoid = nil, nil, nil
 local sprintValueInstance = nil
-local sprintValueConnection = nil
 local currentSprintMultiplier = 1
 
-local resistanceState = {}
-local chanceState = {}
+local killerEntry = nil
+local killerSpeedFolder = nil
+local killerSpeedFolderConn = nil
+local killerEntryChildConn = nil
+local killersFolderConn = nil
+local playersFolderConn = nil
+local workspacePlayersConn = nil
 
-local lastDodgeTime = 0
-local pollAccum = 0
-local lastBlockedState = false
-
-if ENABLE_AUTO_KILL_PREVIOUS and _G.AutoReflexController and type(_G.AutoReflexController.Cleanup) == "function" then
-	pcall(function()
-		_G.AutoReflexController.Cleanup()
-	end)
+if _G.AutoReflexController and _G.AutoReflexController ~= true then
+	_G.AutoReflexPrevious = _G.AutoReflexController
 end
-
 local controller = {}
 _G.AutoReflexController = controller
-
-local function dbg(...)
-	if DEBUG then
-		warn("[AutoReflex]", ...)
-	end
-end
 
 local function safeFind(pathParts)
 	local node = Workspace
@@ -115,29 +102,21 @@ local function findSurvivorsFolder()
 	return safeFind(SURVIVORS_PATH)
 end
 
-local function refreshCharacter()
-	char = LocalPlayer.Character
-	if not char then
-		humanoid = nil
-		hrp = nil
-		return
-	end
+local function getPlayersFolder()
+	return Workspace:FindFirstChild("Players")
+end
 
-	humanoid = char:FindFirstChildOfClass("Humanoid")
-	hrp = char:FindFirstChild("HumanoidRootPart")
-
-	if not humanoid then
-		humanoid = char:FindFirstChild("Humanoid")
-	end
+local function getKillersFolder()
+	local playersFolder = getPlayersFolder()
+	if not playersFolder then return nil end
+	return playersFolder:FindFirstChild("Killers")
 end
 
 local function getModelRootPart(model)
 	if not model then return nil end
-
 	if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
 		return model.PrimaryPart
 	end
-
 	local candidates = {"HumanoidRootPart", "Torso", "UpperTorso", "LowerTorso"}
 	for _, name in ipairs(candidates) do
 		local p = model:FindFirstChild(name)
@@ -145,7 +124,6 @@ local function getModelRootPart(model)
 			return p
 		end
 	end
-
 	return nil
 end
 
@@ -154,23 +132,19 @@ local function getModelPosition(model)
 	if root then
 		return root.Position
 	end
-
 	if not model then return nil end
 
 	local sum = Vector3.new(0, 0, 0)
 	local count = 0
-
 	for _, desc in ipairs(model:GetDescendants()) do
 		if desc:IsA("BasePart") then
 			sum += desc.Position
 			count += 1
 		end
 	end
-
 	if count > 0 then
 		return sum / count
 	end
-
 	return nil
 end
 
@@ -189,20 +163,40 @@ local function getDodgeDurationForSurvivor(name)
 	return DODGE_DURATIONS.Default
 end
 
-local function getMyKillerEntry()
-	local playersFolder = Workspace:FindFirstChild("Players")
-	if not playersFolder then return nil end
+local function killPreviousController()
+	if _G.AutoReflexPrevious then
+		pcall(function()
+			if type(_G.AutoReflexPrevious.Cleanup) == "function" then
+				_G.AutoReflexPrevious.Cleanup()
+			end
+		end)
+		_G.AutoReflexPrevious = nil
+	end
+end
 
-	local killersFolder = playersFolder:FindFirstChild("Killers")
+local function isMyKillerEntry(entry)
+	if not entry or not entry:IsA("Instance") then
+		return false
+	end
+
+	local usernameAttr = entry:GetAttribute("Username")
+	if typeof(usernameAttr) == "string" and usernameAttr == LocalPlayer.Name then
+		return true
+	end
+
+	if entry.Name == LocalPlayer.Name then
+		return true
+	end
+
+	return false
+end
+
+local function findMyKillerEntry()
+	local killersFolder = getKillersFolder()
 	if not killersFolder then return nil end
 
 	for _, child in ipairs(killersFolder:GetChildren()) do
-		local username = child:GetAttribute("Username")
-		if typeof(username) == "string" and username == LocalPlayer.Name then
-			return child
-		end
-
-		if child.Name == LocalPlayer.Name then
+		if isMyKillerEntry(child) then
 			return child
 		end
 	end
@@ -210,62 +204,42 @@ local function getMyKillerEntry()
 	return nil
 end
 
-local function disconnectSprintWatcher()
-	if sprintValueConnection then
+local function interruptActiveOverrides()
+	if controller._activeDodge then
+		local info = controller._activeDodge
+		controller._activeDodge = nil
+
 		pcall(function()
-			sprintValueConnection:Disconnect()
+			if info.bv and info.bv.Parent then
+				info.bv:Destroy()
+			end
 		end)
-		sprintValueConnection = nil
-	end
-	sprintValueInstance = nil
-	currentSprintMultiplier = 1
-end
 
-local function refreshSprintValue()
-	disconnectSprintWatcher()
+		pcall(function()
+			if info.dieConn then
+				info.dieConn:Disconnect()
+			end
+		end)
 
-	local killerEntry = getMyKillerEntry()
-	if not killerEntry then
-		return
-	end
-
-	local speedFolder = killerEntry:FindFirstChild("SpeedMultipliers")
-	if not speedFolder then
-		return
-	end
-
-	local sprintVal = speedFolder:FindFirstChild("Sprinting")
-	if sprintVal and (sprintVal:IsA("NumberValue") or sprintVal:IsA("IntValue")) then
-		sprintValueInstance = sprintVal
-		currentSprintMultiplier = tonumber(sprintVal.Value) or 1
-
-		sprintValueConnection = sprintVal:GetPropertyChangedSignal("Value"):Connect(function()
-			if not running then return end
-			currentSprintMultiplier = tonumber(sprintVal.Value) or 1
+		pcall(function()
+			if humanoid then
+				humanoid.AutoRotate = info.savedAutoRotate
+			end
 		end)
 	end
 end
 
-local function getCurrentSpeed()
-	if sprintValueInstance and sprintValueInstance.Parent and sprintValueInstance.Value ~= nil then
-		local mv = tonumber(sprintValueInstance.Value) or currentSprintMultiplier or 1
-		return 8 * mv
-	end
-
-	if humanoid and humanoid.WalkSpeed then
-		return humanoid.WalkSpeed
-	end
-
-	return 16
+local function clearPendingDodge()
+	controller._pendingBackwardDodgeToken = nil
 end
 
-local function isNoDodgeBlocked()
-	local killerEntry = getMyKillerEntry()
-	if not killerEntry then
+local function hasNoDodgeMultiplier()
+	local entry = killerEntry or findMyKillerEntry()
+	if not entry then
 		return false
 	end
 
-	local speedFolder = killerEntry:FindFirstChild("SpeedMultipliers")
+	local speedFolder = entry:FindFirstChild("SpeedMultipliers")
 	if not speedFolder then
 		return false
 	end
@@ -279,94 +253,283 @@ local function isNoDodgeBlocked()
 	return false
 end
 
-local function interruptActiveOverrides()
-	if controller._activeDodge then
-		local info = controller._activeDodge
-		controller._activeDodge = nil
+local function refreshNoDodgeState()
+	local blocked, reasonName = hasNoDodgeMultiplier()
+	controller._noDodgeBlocked = blocked
+	controller._noDodgeReason = reasonName
 
-		if info.bv and info.bv.Parent then
-			pcall(function()
-				info.bv:Destroy()
-			end)
-		end
-
-		if info.dieConn then
-			pcall(function()
-				info.dieConn:Disconnect()
-			end)
-		end
-
-		if humanoid then
-			pcall(function()
-				humanoid.AutoRotate = info.savedAutoRotate
-			end)
-		end
+	if blocked then
+		clearPendingDodge()
+		interruptActiveOverrides()
 	end
 end
 
-local function performBackwardDodge(dodgeDuration, reasonText)
-	refreshCharacter()
-	if not char or not hrp or not humanoid then
-		dbg("Dodge skipped: missing char/hrp/humanoid")
+local function attachKillerSpeedFolderWatchers()
+	if killerSpeedFolderConn then
+		pcall(function() killerSpeedFolderConn:Disconnect() end)
+		killerSpeedFolderConn = nil
+	end
+
+	if killerEntryChildConn then
+		pcall(function() killerEntryChildConn:Disconnect() end)
+		killerEntryChildConn = nil
+	end
+
+	killerSpeedFolder = nil
+	if not killerEntry or not killerEntry.Parent then
+		refreshNoDodgeState()
 		return
 	end
 
-	local blocked, blockedName = isNoDodgeBlocked()
-	if blocked then
-		dbg("Dodge blocked by", blockedName)
+	local speedFolder = killerEntry:FindFirstChild("SpeedMultipliers")
+	if speedFolder then
+		killerSpeedFolder = speedFolder
+		killerSpeedFolderConn = speedFolder.ChildAdded:Connect(function(child)
+			if not running then return end
+			if NO_DODGE_SPEED_MULTIPLIERS[child.Name] then
+				refreshNoDodgeState()
+			elseif child.Name == "Sprinting" then
+				task.delay(0.02, function()
+					if running then
+						locateAndWatchSprintValue()
+					end
+				end)
+			end
+		end)
+		table.insert(connections, killerSpeedFolderConn)
+
+		local childRemovedConn = speedFolder.ChildRemoved:Connect(function(child)
+			if not running then return end
+			if NO_DODGE_SPEED_MULTIPLIERS[child.Name] or child.Name == "Sprinting" then
+				task.delay(0.02, function()
+					if running then
+						refreshNoDodgeState()
+						if child.Name == "Sprinting" then
+							locateAndWatchSprintValue()
+						end
+					end
+				end)
+			end
+		end)
+		table.insert(connections, childRemovedConn)
+	else
+		killerEntryChildConn = killerEntry.ChildAdded:Connect(function(child)
+			if not running then return end
+			if child.Name == "SpeedMultipliers" then
+				task.delay(0.03, function()
+					if running then
+						attachKillerSpeedFolderWatchers()
+						locateAndWatchSprintValue()
+					end
+				end)
+			end
+		end)
+		table.insert(connections, killerEntryChildConn)
+	end
+
+	refreshNoDodgeState()
+end
+
+local function watchMyKillerEntry()
+	killerEntry = findMyKillerEntry()
+	attachKillerSpeedFolderWatchers()
+end
+
+local function installKillerEntryDiscoveryWatchers()
+	local function hookKillersFolder(killersFolder)
+		if killersFolderConn then
+			pcall(function() killersFolderConn:Disconnect() end)
+			killersFolderConn = nil
+		end
+
+		if not killersFolder then return end
+
+		killersFolderConn = killersFolder.ChildAdded:Connect(function(child)
+			if not running then return end
+			if isMyKillerEntry(child) then
+				task.delay(0.03, function()
+					if running then
+						watchMyKillerEntry()
+						locateAndWatchSprintValue()
+					end
+				end)
+			end
+		end)
+		table.insert(connections, killersFolderConn)
+
+		local removeConn = killersFolder.ChildRemoved:Connect(function(child)
+			if not running then return end
+			if child == killerEntry or isMyKillerEntry(child) then
+				task.delay(0.03, function()
+					if running then
+						watchMyKillerEntry()
+						locateAndWatchSprintValue()
+					end
+				end)
+			end
+		end)
+		table.insert(connections, removeConn)
+	end
+
+	local function hookPlayersFolder(playersFolder)
+		if playersFolderConn then
+			pcall(function() playersFolderConn:Disconnect() end)
+			playersFolderConn = nil
+		end
+
+		if not playersFolder then return end
+
+		playersFolderConn = playersFolder.ChildAdded:Connect(function(child)
+			if not running then return end
+			if child.Name == "Killers" then
+				task.delay(0.03, function()
+					if running then
+						hookKillersFolder(child)
+						watchMyKillerEntry()
+						locateAndWatchSprintValue()
+					end
+				end)
+			end
+		end)
+		table.insert(connections, playersFolderConn)
+
+		hookKillersFolder(playersFolder:FindFirstChild("Killers"))
+	end
+
+	if workspacePlayersConn then
+		pcall(function() workspacePlayersConn:Disconnect() end)
+		workspacePlayersConn = nil
+	end
+
+	local currentPlayersFolder = getPlayersFolder()
+	if currentPlayersFolder then
+		hookPlayersFolder(currentPlayersFolder)
+	else
+		workspacePlayersConn = Workspace.ChildAdded:Connect(function(child)
+			if not running then return end
+			if child.Name == "Players" then
+				task.delay(0.03, function()
+					if running then
+						hookPlayersFolder(child)
+						watchMyKillerEntry()
+						locateAndWatchSprintValue()
+					end
+				end)
+			end
+		end)
+		table.insert(connections, workspacePlayersConn)
+	end
+end
+
+function locateAndWatchSprintValue()
+	if sprintValueInstance and sprintValueInstance._conn then
+		pcall(function() sprintValueInstance._conn:Disconnect() end)
+		sprintValueInstance._conn = nil
+	end
+	sprintValueInstance = nil
+	currentSprintMultiplier = 1
+
+	local myKillerEntry = killerEntry or findMyKillerEntry()
+	if not myKillerEntry then
 		return
 	end
+
+	local speedMultFolder = myKillerEntry:FindFirstChild("SpeedMultipliers")
+	if not speedMultFolder then
+		return
+	end
+
+	local sprintVal = speedMultFolder:FindFirstChild("Sprinting")
+	if sprintVal and (sprintVal:IsA("NumberValue") or sprintVal:IsA("IntValue")) then
+		sprintValueInstance = sprintVal
+		currentSprintMultiplier = sprintVal.Value or 1
+		local conn = sprintVal:GetPropertyChangedSignal("Value"):Connect(function()
+			if not running then return end
+			currentSprintMultiplier = sprintVal.Value or 1
+		end)
+		sprintVal._conn = conn
+		table.insert(connections, conn)
+	end
+end
+
+local function getCurrentSpeed()
+	if sprintValueInstance and sprintValueInstance.Value then
+		local mv = tonumber(sprintValueInstance.Value) or currentSprintMultiplier or 1
+		return 8 * mv
+	end
+	if humanoid and humanoid.WalkSpeed then
+		return humanoid.WalkSpeed
+	end
+	return 8
+end
+
+local function isPlayingKiller()
+	if humanoid then
+		local okMax = humanoid.MaxHealth and humanoid.MaxHealth > 500
+		local okCur = humanoid.Health and humanoid.Health > 500
+		if okMax or okCur then
+			return true
+		end
+	end
+
+	local entry = killerEntry or findMyKillerEntry()
+	if entry then
+		return true
+	end
+
+	return false
+end
+
+local function performBackwardDodge(dodgeDuration)
+	if not isPlayingKiller() then return end
+	if hasNoDodgeMultiplier() then return end
+	if not char or not hrp or not humanoid then return end
 
 	local speed = getCurrentSpeed()
-	if speed < MIN_SPEED_TO_TRIGGER then
-		dbg("Dodge skipped: speed too low", speed)
-		return
-	end
-
-	if type(DODGE_MAX_SPEED) == "number" then
+	if speed < MIN_SPEED_TO_TRIGGER then return end
+	if DODGE_MAX_SPEED and type(DODGE_MAX_SPEED) == "number" then
 		speed = math.min(speed, DODGE_MAX_SPEED)
 	end
 
 	local backward = getHorizontalUnit(-hrp.CFrame.LookVector)
-	if not backward then
-		dbg("Dodge skipped: no backward vector")
-		return
-	end
+	if not backward then return end
 
 	interruptActiveOverrides()
 
 	local savedAutoRotate = humanoid.AutoRotate
 	humanoid.AutoRotate = false
-
-	local currentY = 0
-	pcall(function()
-		currentY = hrp.AssemblyLinearVelocity.Y
-	end)
-
-	local newVel = Vector3.new(backward.X * speed, currentY, backward.Z * speed)
-
-	pcall(function()
-		hrp.AssemblyLinearVelocity = newVel
-	end)
+	humanoid.WalkSpeed = 0
 
 	local bv = Instance.new("BodyVelocity")
 	bv.Name = "AutoReflexBackwardDodge"
-	bv.MaxForce = DODGE_FORCE_MAX
+
+	local maxForceHoriz
+	if typeof(DODGE_FORCE_MAX) == "Vector3" then
+		maxForceHoriz = Vector3.new(DODGE_FORCE_MAX.X, 0, DODGE_FORCE_MAX.Z)
+	else
+		local scalar = tonumber(DODGE_FORCE_MAX) or 1e5
+		maxForceHoriz = Vector3.new(scalar, 0, scalar)
+	end
+
+	local preservedY = 0
+	pcall(function()
+		if hrp and hrp:IsA("BasePart") then
+			preservedY = hrp.Velocity.Y or 0
+		end
+	end)
+
+	bv.MaxForce = maxForceHoriz
 	bv.P = DODGE_FORCE_P
-	bv.Velocity = newVel
+	bv.Velocity = Vector3.new(backward.X * speed, preservedY, backward.Z * speed)
 	bv.Parent = hrp
 
 	local dieConn
 	dieConn = humanoid.Died:Connect(function()
 		if bv and bv.Parent then
-			pcall(function()
-				bv:Destroy()
-			end)
+			pcall(function() bv:Destroy() end)
 		end
 		if dieConn then
-			pcall(function()
-				dieConn:Disconnect()
-			end)
+			pcall(function() dieConn:Disconnect() end)
 		end
 	end)
 
@@ -376,252 +539,351 @@ local function performBackwardDodge(dodgeDuration, reasonText)
 		dieConn = dieConn,
 	}
 
-	dbg("DODGE FIRED", reasonText or "")
+	if ENABLE_AUTO_KILL_PREVIOUS then
+		killPreviousController()
+	end
 
 	task.delay(tonumber(dodgeDuration) or DODGE_DURATIONS.Default, function()
-		if not running then return end
-
+		if not controller then return end
 		local info = controller._activeDodge
 		controller._activeDodge = nil
 
 		if info and info.bv and info.bv.Parent then
-			pcall(function()
-				info.bv:Destroy()
-			end)
+			pcall(function() info.bv:Destroy() end)
 		end
-
 		if info and info.dieConn then
-			pcall(function()
-				info.dieConn:Disconnect()
-			end)
+			pcall(function() info.dieConn:Disconnect() end)
 		end
-
 		if info and humanoid then
-			pcall(function()
-				humanoid.AutoRotate = info.savedAutoRotate
-			end)
+			pcall(function() humanoid.AutoRotate = info.savedAutoRotate end)
 		end
 	end)
 end
 
-local function scheduleTrackedBackwardDodge(survivor, delayTime, dodgeDuration, reasonText)
-	refreshCharacter()
-	if not hrp then
-		dbg("Schedule skipped: no HRP")
-		return
-	end
+local function scheduleTrackedBackwardDodge(survivor, delayTime, dodgeDuration)
+	if not survivor then return end
+	if not isPlayingKiller() then return end
+	if hasNoDodgeMultiplier() then return end
 
-	local blocked, blockedName = isNoDodgeBlocked()
-	if blocked then
-		dbg("Schedule blocked by", blockedName)
-		return
+	if not hrp then
+		local c = LocalPlayer.Character
+		if c then
+			hrp = c:FindFirstChild("HumanoidRootPart")
+		end
+		if not hrp then return end
 	end
 
 	local sPos = getModelPosition(survivor)
-	if not sPos then
-		dbg("Schedule skipped: no survivor position for", survivor and survivor.Name or "nil")
-		return
-	end
-
+	if not sPos then return end
 	local dist = (hrp.Position - sPos).Magnitude
-	if dist > DODGE_RANGE then
-		dbg("Schedule skipped: out of range", survivor.Name, dist)
-		return
-	end
+	if dist > DODGE_RANGE then return end
 
-	if os.clock() - lastDodgeTime < DODGE_COOLDOWN then
-		dbg("Schedule skipped: cooldown")
-		return
-	end
+	if tick() - lastDodgeTime < DODGE_COOLDOWN then return end
+	lastDodgeTime = tick()
 
-	lastDodgeTime = os.clock()
-
-	local token = tostring(os.clock()) .. "_" .. tostring(math.random(1000, 9999))
+	local delayToUse = tonumber(delayTime) or 0
+	local durationToUse = tonumber(dodgeDuration) or DODGE_DURATIONS.Default
+	local token = tostring(tick()) .. "_" .. tostring(math.random(1000, 9999))
 	controller._pendingBackwardDodgeToken = token
 
-	dbg("Trigger detected for", survivor.Name, "reason:", reasonText or "unknown", "dist:", math.floor(dist))
-
-	task.delay(tonumber(delayTime) or 0, function()
+	task.delay(delayToUse, function()
 		if not running then return end
 		if controller._pendingBackwardDodgeToken ~= token then return end
 		controller._pendingBackwardDodgeToken = nil
 
-		refreshCharacter()
-		if not hrp or not humanoid then
-			dbg("Delayed dodge cancelled: no char/hrp/humanoid")
-			return
-		end
-
-		if not survivor or not survivor.Parent then
-			dbg("Delayed dodge cancelled: survivor missing")
-			return
-		end
-
-		local blockedNow, blockedNameNow = isNoDodgeBlocked()
-		if blockedNow then
-			dbg("Delayed dodge cancelled by", blockedNameNow)
-			return
-		end
+		if hasNoDodgeMultiplier() then return end
+		if not survivor or not survivor.Parent then return end
+		if not isPlayingKiller() then return end
+		if not char or not hrp or not humanoid then return end
 
 		local latestPos = getModelPosition(survivor)
-		if not latestPos then
-			dbg("Delayed dodge cancelled: latest pos missing")
-			return
-		end
+		if not latestPos then return end
+		local latestDist = (hrp.Position - latestPos).Magnitude
+		if latestDist > DODGE_RANGE then return end
 
-		if (hrp.Position - latestPos).Magnitude > DODGE_RANGE then
-			dbg("Delayed dodge cancelled: moved out of range")
-			return
-		end
-
-		performBackwardDodge(dodgeDuration, reasonText)
+		performBackwardDodge(durationToUse)
 	end)
 end
 
-local function handleResistanceSurvivor(survivor)
-	if not survivor or not TARGET_NAMES[survivor.Name] then return end
-	if survivor.Name == "Chance" then return end
+local function onResistanceValueChanged(resVal)
+	if not resVal then return end
+	if hasNoDodgeMultiplier() then return end
 
-	local resistanceFolder = survivor:FindFirstChild(RESISTANCE_FOLDER_NAME)
-	local resistanceValue = resistanceFolder and resistanceFolder:FindFirstChild(RESISTANCE_VALUE_NAME)
+	local v = tonumber(resVal.Value) or 0
+	if not TRIGGER_VALUES[v] then return end
+	if not isPlayingKiller() then return end
 
-	local currentValue = nil
-	if resistanceValue and (resistanceValue:IsA("IntValue") or resistanceValue:IsA("NumberValue")) then
-		currentValue = tonumber(resistanceValue.Value)
+	local mapping = watchedValues[resVal]
+	local survivor = mapping and mapping.survivor
+	if not survivor then
+		if resVal.Parent and resVal.Parent.Parent then
+			survivor = resVal.Parent.Parent
+		end
+	end
+	if not survivor then return end
+
+	local sPos = getModelPosition(survivor)
+	if not sPos then return end
+
+	if not hrp then
+		local c = LocalPlayer.Character
+		if c then
+			hrp = c:FindFirstChild("HumanoidRootPart")
+		end
+		if not hrp then return end
 	end
 
-	local prevValue = resistanceState[survivor]
-	resistanceState[survivor] = currentValue
-
-	if currentValue and TRIGGER_VALUES[currentValue] and prevValue ~= currentValue then
+	local dist = (hrp.Position - sPos).Magnitude
+	if dist <= DODGE_RANGE then
 		scheduleTrackedBackwardDodge(
 			survivor,
 			DODGE_DELAYS[survivor.Name] or 0,
-			getDodgeDurationForSurvivor(survivor.Name),
-			survivor.Name .. " ResistanceStatus = " .. tostring(currentValue)
+			getDodgeDurationForSurvivor(survivor.Name)
 		)
 	end
 end
 
-local function handleChanceSurvivor(survivor)
-	if not survivor or survivor.Name ~= "Chance" then return end
+local function triggerChanceShootingGunDodge(chanceSurvivor)
+	if not chanceSurvivor or chanceSurvivor.Name ~= "Chance" then return end
+	if not isPlayingKiller() then return end
+	if hasNoDodgeMultiplier() then return end
 
-	local speedFolder = survivor:FindFirstChild("SpeedMultipliers")
-	local hasShootingGun = speedFolder and speedFolder:FindFirstChild("ShootingGun") ~= nil
+	local sPos = getModelPosition(chanceSurvivor)
+	if not sPos then return end
 
-	local prev = chanceState[survivor]
-	chanceState[survivor] = hasShootingGun
+	if not hrp then
+		local c = LocalPlayer.Character
+		if c then
+			hrp = c:FindFirstChild("HumanoidRootPart")
+		end
+		if not hrp then return end
+	end
 
-	if hasShootingGun and not prev then
+	local dist = (hrp.Position - sPos).Magnitude
+	if dist <= DODGE_RANGE then
 		scheduleTrackedBackwardDodge(
-			survivor,
-			DODGE_DELAYS.Chance or 0,
-			getDodgeDurationForSurvivor("Chance"),
-			"Chance ShootingGun"
+			chanceSurvivor,
+			DODGE_DELAYS.Chance,
+			getDodgeDurationForSurvivor("Chance")
 		)
 	end
 end
 
-local function scanSurvivors()
-	local survivorsFolder = findSurvivorsFolder()
-	if not survivorsFolder then
-		return
-	end
+local function watchChanceShootingGun(chanceSurvivor)
+	if not chanceSurvivor or chanceSurvivor.Name ~= "Chance" then return end
 
-	local seen = {}
+	local speedFolder = chanceSurvivor:FindFirstChild("SpeedMultipliers")
+	if speedFolder then
+		local existing = speedFolder:FindFirstChild("ShootingGun")
+		if existing and not watchedChanceObjects[existing] then
+			watchedChanceObjects[existing] = true
+			triggerChanceShootingGunDodge(chanceSurvivor)
+		end
 
-	for _, survivor in ipairs(survivorsFolder:GetChildren()) do
-		if TARGET_NAMES[survivor.Name] then
-			seen[survivor] = true
-
-			if survivor.Name == "Chance" then
-				handleChanceSurvivor(survivor)
-			else
-				handleResistanceSurvivor(survivor)
+		local conn = speedFolder.ChildAdded:Connect(function(child)
+			if not running then return end
+			if child.Name == "ShootingGun" and not watchedChanceObjects[child] then
+				watchedChanceObjects[child] = true
+				triggerChanceShootingGunDodge(chanceSurvivor)
 			end
-		end
-	end
-
-	for survivor, _ in pairs(resistanceState) do
-		if not seen[survivor] or survivor.Parent == nil then
-			resistanceState[survivor] = nil
-		end
-	end
-
-	for survivor, _ in pairs(chanceState) do
-		if not seen[survivor] or survivor.Parent == nil then
-			chanceState[survivor] = nil
-		end
+		end)
+		table.insert(connections, conn)
+	else
+		local conn2 = chanceSurvivor.ChildAdded:Connect(function(child)
+			if not running then return end
+			if child.Name == "SpeedMultipliers" then
+				task.delay(0.03, function()
+					watchChanceShootingGun(chanceSurvivor)
+				end)
+			end
+		end)
+		table.insert(connections, conn2)
 	end
 end
 
-table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
-	task.delay(0.05, function()
-		if not running then return end
-		refreshCharacter()
-		refreshSprintValue()
-	end)
-end))
+local function watchSurvivor(survivor)
+	if not survivor or not TARGET_NAMES[survivor.Name] then return end
 
-refreshCharacter()
-refreshSprintValue()
-
-table.insert(connections, RunService.Heartbeat:Connect(function(dt)
-	if not running then return end
-
-	pollAccum += dt
-	if pollAccum < POLL_INTERVAL then
+	if survivor.Name == "Chance" then
+		watchChanceShootingGun(survivor)
 		return
 	end
-	pollAccum = 0
 
-	refreshCharacter()
+	local folder = survivor:FindFirstChild(RESISTANCE_FOLDER_NAME)
+	if folder then
+		local val = folder:FindFirstChild(RESISTANCE_VALUE_NAME)
+		if val and (val:IsA("IntValue") or val:IsA("NumberValue")) then
+			if not watchedValues[val] then
+				local conn = val:GetPropertyChangedSignal("Value"):Connect(function()
+					onResistanceValueChanged(val)
+				end)
+				watchedValues[val] = { conn = conn, survivor = survivor }
+				table.insert(connections, conn)
+				onResistanceValueChanged(val)
+			end
+		else
+			local conn2 = folder.ChildAdded:Connect(function(child)
+				if not running then return end
+				if child.Name == RESISTANCE_VALUE_NAME and (child:IsA("IntValue") or child:IsA("NumberValue")) then
+					if not watchedValues[child] then
+						local conn = child:GetPropertyChangedSignal("Value"):Connect(function()
+							onResistanceValueChanged(child)
+						end)
+						watchedValues[child] = { conn = conn, survivor = survivor }
+						table.insert(connections, conn)
+						onResistanceValueChanged(child)
+					end
+				end
+			end)
+			table.insert(connections, conn2)
+		end
+	else
+		local c = survivor.ChildAdded:Connect(function(child)
+			if not running then return end
+			if child.Name == RESISTANCE_FOLDER_NAME then
+				task.delay(0.03, function()
+					watchSurvivor(survivor)
+				end)
+			end
+		end)
+		table.insert(connections, c)
+	end
+end
 
-	if sprintValueInstance and sprintValueInstance.Parent == nil then
-		refreshSprintValue()
+local function scanAndWatchSurvivors()
+	local survivorsFolder = findSurvivorsFolder()
+	if not survivorsFolder then return end
+
+	for _, child in ipairs(survivorsFolder:GetChildren()) do
+		pcall(function()
+			watchSurvivor(child)
+		end)
 	end
 
-	local blocked = isNoDodgeBlocked()
-	if blocked and not lastBlockedState then
-		dbg("Blocked state entered")
-		controller._pendingBackwardDodgeToken = nil
-		interruptActiveOverrides()
-	end
-	lastBlockedState = blocked and true or false
+	local connAdd = survivorsFolder.ChildAdded:Connect(function(child)
+		if not running then return end
+		pcall(function()
+			watchSurvivor(child)
+		end)
+	end)
+	table.insert(connections, connAdd)
+end
 
-	scanSurvivors()
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == KILL_HOTKEY then
+		killPreviousController()
+	end
 end))
+
+installKillerEntryDiscoveryWatchers()
+watchMyKillerEntry()
+locateAndWatchSprintValue()
+
+local function onCharacterAdded(c)
+	char = c
+	humanoid = char:FindFirstChildOfClass("Humanoid")
+	hrp = char:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid then
+		humanoid = char:WaitForChild("Humanoid", 2)
+	end
+	if not hrp then
+		hrp = char:WaitForChild("HumanoidRootPart", 2)
+	end
+
+	task.delay(0.05, function()
+		if running then
+			watchMyKillerEntry()
+			locateAndWatchSprintValue()
+			refreshNoDodgeState()
+		end
+	end)
+end
+
+if LocalPlayer.Character then
+	onCharacterAdded(LocalPlayer.Character)
+end
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(onCharacterAdded))
+
+scanAndWatchSurvivors()
 
 local function cleanup()
 	running = false
 
 	for _, conn in ipairs(connections) do
-		pcall(function()
-			conn:Disconnect()
-		end)
+		pcall(function() conn:Disconnect() end)
 	end
 	connections = {}
 
-	disconnectSprintWatcher()
-
+	for _, info in pairs(watchedValues) do
+		if info and info.conn then
+			pcall(function() info.conn:Disconnect() end)
+		end
+	end
+	watchedValues = {}
+	watchedChanceObjects = {}
 	controller._pendingBackwardDodgeToken = nil
-	resistanceState = {}
-	chanceState = {}
+
+	if sprintValueInstance and sprintValueInstance._conn then
+		pcall(function() sprintValueInstance._conn:Disconnect() end)
+		sprintValueInstance._conn = nil
+	end
+	sprintValueInstance = nil
+
+	if killerSpeedFolderConn then
+		pcall(function() killerSpeedFolderConn:Disconnect() end)
+		killerSpeedFolderConn = nil
+	end
+	if killerEntryChildConn then
+		pcall(function() killerEntryChildConn:Disconnect() end)
+		killerEntryChildConn = nil
+	end
+	if killersFolderConn then
+		pcall(function() killersFolderConn:Disconnect() end)
+		killersFolderConn = nil
+	end
+	if playersFolderConn then
+		pcall(function() playersFolderConn:Disconnect() end)
+		playersFolderConn = nil
+	end
+	if workspacePlayersConn then
+		pcall(function() workspacePlayersConn:Disconnect() end)
+		workspacePlayersConn = nil
+	end
+
+	killerEntry = nil
+	killerSpeedFolder = nil
 
 	interruptActiveOverrides()
 
 	if _G.AutoReflexController == controller then
 		_G.AutoReflexController = nil
 	end
-
 	controller.Cleanup = nil
 end
-
 controller.Cleanup = cleanup
 
-function controller.TriggerDodgeNow()
-	performBackwardDodge(DODGE_DURATIONS.Default, "manual trigger function")
+function controller.KillPrevious()
+	killPreviousController()
 end
 
-dbg("Polling reflex script running.")
+function controller.TriggerDodgeNow()
+	if hrp and not hasNoDodgeMultiplier() then
+		performBackwardDodge(DODGE_DURATIONS.Default)
+	end
+end
+
+if RunService:IsStudio() then
+	warn(
+		"[AutoReflex_BackwardOnly] running. Press 'K' to kill previous controller.",
+		"Shed delay:", DODGE_DELAYS.Shedletsky,
+		"Jane delay:", DODGE_DELAYS.JaneDoe,
+		"Chance delay:", DODGE_DELAYS.Chance,
+		"Shed duration:", DODGE_DURATIONS.Shedletsky,
+		"Jane duration:", DODGE_DURATIONS.JaneDoe,
+		"Chance duration:", DODGE_DURATIONS.Chance,
+		"Range:", DODGE_RANGE
+	)
+end
 end
