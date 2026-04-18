@@ -7,8 +7,10 @@ local SURVIVOR_MAX = 100
 local KILLER_MAX = 110
 local DEPLETION_RATE = 10.07
 local REGEN_RATE = 20
-local EXHAUSTED_REGEN_DELAY = 2
-local REST_REGEN_DELAY = 0.42
+local REGEN_PAUSE_BUILD_RATE = 0.05
+local REGEN_PAUSE_STOP_BONUS = 0.1
+local REGEN_PAUSE_MIN = 0.2
+local REGEN_PAUSE_MAX = 3
 local LOW_STAMINA_WARNING = 30
 
 local RUN_ANIM_IDS = {
@@ -203,7 +205,6 @@ local function handleTrackStart(controller, track)
         controller.runningTracks[track] = true
         controller.isRunning = true
         controller.restDelayActive = false
-        controller.restDelayTimer = 0
         controller.trackStopConns = controller.trackStopConns or {}
 
         if controller.trackStopConns[track] then
@@ -235,7 +236,11 @@ local function handleTrackStart(controller, track)
             if not controller.isRunning then
                 if controller.stamina and controller.stamina > 0 then
                     controller.restDelayActive = true
-                    controller.restDelayTimer = REST_REGEN_DELAY
+                    if controller.restDelayTimer > REGEN_PAUSE_STOP_BONUS then
+                        controller.restDelayTimer = math.clamp(controller.restDelayTimer + REGEN_PAUSE_STOP_BONUS, 0, REGEN_PAUSE_MAX)
+                    else
+                        controller.restDelayTimer = REGEN_PAUSE_STOP_BONUS
+                    end
                 end
             end
         end)
@@ -487,15 +492,18 @@ local function setupPlayer(player)
         local isSprinting = controller.isRunning == true
 
         if isSprinting then
+            if controller.stamina > 0 then
+                controller.restDelayTimer = math.clamp(controller.restDelayTimer + (dt * REGEN_PAUSE_BUILD_RATE), REGEN_PAUSE_MIN, REGEN_PAUSE_MAX)
+            end
+
             controller.stamina = controller.stamina - (DEPLETION_RATE * dt)
             controller.restDelayActive = false
-            controller.restDelayTimer = 0
 
             if controller.stamina <= 0 then
                 controller.stamina = 0
                 if not controller.exhausted then
                     controller.exhausted = true
-                    controller.exhaustedTimer = EXHAUSTED_REGEN_DELAY
+                    controller.exhaustedTimer = math.clamp(controller.restDelayTimer, REGEN_PAUSE_STOP_BONUS, REGEN_PAUSE_MAX)
                 end
             end
         else
@@ -504,6 +512,7 @@ local function setupPlayer(player)
                 if controller.exhaustedTimer <= 0 then
                     controller.exhausted = false
                     controller.exhaustedTimer = 0
+                    controller.restDelayTimer = 0
                 end
             elseif controller.restDelayActive then
                 controller.restDelayTimer = controller.restDelayTimer - dt
