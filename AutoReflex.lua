@@ -44,17 +44,33 @@ do
 	local TWOTIME_TURN_GYRO_MAX_TORQUE = Vector3.new(1e8, 1e8, 1e8)
 
 	local DODGE_DELAYS = {
-		Shedletsky = 0,
-		JaneDoe = 0,
-		Chance = 0,
+		Shedletsky = 0.2,
+		JaneDoe = 0.1,
+		Chance = 0.4,
 	}
 
 	local DODGE_DURATIONS = {
 		Default = 0.35,
 		Shedletsky = 0.3,
-		JaneDoe = 0.5,
-		Chance = 0.5,
+		JaneDoe = 0.4,
+		Chance = 0.4,
 	}
+
+	local TRIGGER_RANGES = {
+		Default = DODGE_RANGE,
+		Chance = 50,
+	}
+
+	local CHANCE_TRIGGER_ANIMATION_ID = "133491532453922"
+	local JANE_ATTACK_RANGE = 13
+
+	local SMART_DODGE_MIN_DISTANCE = 5
+	local SMART_DODGE_SIDE_OFFSET = 1.1
+	local SMART_DODGE_MIN_CLEARANCE = 1.25
+	local SMART_DODGE_HEIGHT_SAMPLES = {1.4, 2.8, 4.2}
+
+	local DODGE_POPUP_GUI_NAME = "AutoReflexDodgeGui"
+	local DODGE_POPUP_TEXT = "DODGING"
 
 	local NO_DODGE_SPEED_MULTIPLIERS = {
 		Entanglement = true,
@@ -98,6 +114,9 @@ do
 	local pollAccum = 0
 	local lastBlockedState = false
 	local lastKillerPresent = false
+
+	local dodgeGui = nil
+	local dodgeLabel = nil
 
 	if ENABLE_AUTO_KILL_PREVIOUS and _G.AutoReflexController and type(_G.AutoReflexController.Cleanup) == "function" then
 		pcall(function()
@@ -187,11 +206,22 @@ do
 	end
 
 	local function getHorizontalUnit(vec)
+		if typeof(vec) ~= "Vector3" then
+			return nil
+		end
 		local flat = Vector3.new(vec.X, 0, vec.Z)
 		if flat.Magnitude < 0.001 then
 			return nil
 		end
 		return flat.Unit
+	end
+
+	local function getPerpendicularUnit(vec)
+		local unit = getHorizontalUnit(vec)
+		if not unit then
+			return nil
+		end
+		return Vector3.new(-unit.Z, 0, unit.X)
 	end
 
 	local function rotateVectorAroundY(vec, radians)
@@ -204,6 +234,21 @@ do
 		)
 	end
 
+	local function buildRaycastParams(charRef)
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = charRef and {charRef} or {}
+		return params
+	end
+
+	local function hasGroundSupportAtPosition(position, charRef)
+		local params = buildRaycastParams(charRef)
+		local origin = position + Vector3.new(0, GROUND_RAY_HEIGHT, 0)
+		local direction = Vector3.new(0, -(GROUND_RAY_HEIGHT + GROUND_RAY_DISTANCE), 0)
+		local result = Workspace:Raycast(origin, direction, params)
+		return result ~= nil
+	end
+
 	local function hasGroundSupportFor(hrpRef, humanoidRef, charRef)
 		if not hrpRef or not hrpRef.Parent or not humanoidRef or not humanoidRef.Parent then
 			return false
@@ -213,15 +258,129 @@ do
 			return true
 		end
 
-		local params = RaycastParams.new()
-		params.FilterType = Enum.RaycastFilterType.Exclude
-		params.FilterDescendantsInstances = charRef and {charRef} or {}
+		return hasGroundSupportAtPosition(hrpRef.Position, charRef)
+	end
 
-		local origin = hrpRef.Position + Vector3.new(0, GROUND_RAY_HEIGHT, 0)
-		local direction = Vector3.new(0, -(GROUND_RAY_HEIGHT + GROUND_RAY_DISTANCE), 0)
-		local result = Workspace:Raycast(origin, direction, params)
+	local function extractAnimationId(rawId)
+		if typeof(rawId) ~= "string" then
+			return nil
+		end
+		return rawId:match("(%d+)")
+	end
 
-		return result ~= nil
+	local function getHumanoidFromModel(model)
+		if not model then return nil end
+		return model:FindFirstChildOfClass("Humanoid") or model:FindFirstChild("Humanoid")
+	end
+
+	local function isAnimationPlaying(model, targetAnimationId)
+		local hum = getHumanoidFromModel(model)
+		if not hum then
+			return false
+		end
+
+		local ok, tracks = pcall(function()
+			return hum:GetPlayingAnimationTracks()
+		end)
+
+		if not ok or not tracks then
+			return false
+		end
+
+		local targetId = tostring(targetAnimationId)
+		for _, track in ipairs(tracks) do
+			local anim = track.Animation
+			local animId = anim and extractAnimationId(anim.AnimationId)
+			if animId == targetId then
+				return true
+			end
+		end
+
+		return false
+	end
+
+	local function getPlayerGui()
+		local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if pg then
+			return pg
+		end
+
+		local ok, result = pcall(function()
+			return LocalPlayer:WaitForChild("PlayerGui", 2)
+		end)
+
+		if ok then
+			return result
+		end
+
+		return nil
+	end
+
+	local function ensureDodgeGui()
+		local playerGui = getPlayerGui()
+		if not playerGui then
+			return nil, nil
+		end
+
+		if dodgeGui and dodgeGui.Parent == playerGui and dodgeLabel and dodgeLabel.Parent == dodgeGui then
+			return dodgeGui, dodgeLabel
+		end
+
+		local existing = playerGui:FindFirstChild(DODGE_POPUP_GUI_NAME)
+		if existing and existing:IsA("ScreenGui") then
+			local existingLabel = existing:FindFirstChild("DodgeText")
+			if existingLabel and existingLabel:IsA("TextLabel") then
+				dodgeGui = existing
+				dodgeLabel = existingLabel
+				return dodgeGui, dodgeLabel
+			end
+
+			pcall(function()
+				existing:Destroy()
+			end)
+		end
+
+		local gui = Instance.new("ScreenGui")
+		gui.Name = DODGE_POPUP_GUI_NAME
+		gui.ResetOnSpawn = false
+		gui.IgnoreGuiInset = true
+		gui.DisplayOrder = 99999
+		gui.Enabled = false
+		gui.Parent = playerGui
+
+		local label = Instance.new("TextLabel")
+		label.Name = "DodgeText"
+		label.AnchorPoint = Vector2.new(0.5, 0.5)
+		label.Position = UDim2.new(0.5, 0, 0.28, 0)
+		label.Size = UDim2.new(0, 320, 0, 70)
+		label.BackgroundTransparency = 1
+		label.BorderSizePixel = 0
+		label.Text = DODGE_POPUP_TEXT
+		label.TextScaled = true
+		label.Font = Enum.Font.GothamBlack
+		label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		label.Visible = false
+		label.Parent = gui
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 3
+		stroke.Color = Color3.fromRGB(0, 0, 0)
+		stroke.Parent = label
+
+		dodgeGui = gui
+		dodgeLabel = label
+		return dodgeGui, dodgeLabel
+	end
+
+	local function setDodgePopupVisible(isVisible)
+		local gui, label = ensureDodgeGui()
+		if not gui or not label then
+			return
+		end
+
+		label.Text = DODGE_POPUP_TEXT
+		label.Visible = isVisible and true or false
+		gui.Enabled = isVisible and true or false
 	end
 
 	local function getDodgeDurationForSurvivor(name)
@@ -229,6 +388,13 @@ do
 			return DODGE_DURATIONS[name]
 		end
 		return DODGE_DURATIONS.Default
+	end
+
+	local function getTriggerRangeForSurvivor(name)
+		if name and TRIGGER_RANGES[name] then
+			return TRIGGER_RANGES[name]
+		end
+		return TRIGGER_RANGES.Default
 	end
 
 	local function getMyKillerEntry()
@@ -359,6 +525,8 @@ do
 				info.humanoid.AutoRotate = info.savedAutoRotate
 			end)
 		end
+
+		setDodgePopupVisible(false)
 	end
 
 	local function endActiveTurn(info)
@@ -412,12 +580,105 @@ do
 			return
 		end
 
-		controller._pendingBackwardDodgeToken = nil
+		controller._pendingDodgeToken = nil
 		interruptActiveOverrides()
 		disconnectSprintWatcher()
 	end
 
-	local function performBackwardDodge(dodgeDuration, reasonText)
+	local function estimateDirectionClearance(originPos, dir, travelDistance, charRef)
+		local moveDir = getHorizontalUnit(dir)
+		if not moveDir then
+			return 0
+		end
+
+		local params = buildRaycastParams(charRef)
+		local clearance = travelDistance
+		local perp = getPerpendicularUnit(moveDir)
+
+		for _, height in ipairs(SMART_DODGE_HEIGHT_SAMPLES) do
+			local baseOrigin = originPos + Vector3.new(0, height, 0)
+			local origins = {baseOrigin}
+
+			if perp then
+				table.insert(origins, baseOrigin + perp * SMART_DODGE_SIDE_OFFSET)
+				table.insert(origins, baseOrigin - perp * SMART_DODGE_SIDE_OFFSET)
+			end
+
+			for _, rayOrigin in ipairs(origins) do
+				local result = Workspace:Raycast(rayOrigin, moveDir * travelDistance, params)
+				if result and result.Distance < clearance then
+					clearance = result.Distance
+				end
+			end
+		end
+
+		return clearance
+	end
+
+	local function distancePointToSegmentXZ(point, segA, segB)
+		local p = Vector3.new(point.X, 0, point.Z)
+		local a = Vector3.new(segA.X, 0, segA.Z)
+		local b = Vector3.new(segB.X, 0, segB.Z)
+
+		local ab = b - a
+		local abLenSq = ab:Dot(ab)
+		if abLenSq <= 1e-6 then
+			return (p - a).Magnitude
+		end
+
+		local t = math.clamp((p - a):Dot(ab) / abLenSq, 0, 1)
+		local closest = a + ab * t
+		return (p - closest).Magnitude
+	end
+
+	local function chooseBestDodgeDirection(hrpRef, charRef, candidateDirs, travelDistance, extraScoreFn)
+		local bestDir = nil
+		local bestScore = nil
+		local fallbackDir = nil
+
+		for index, candidate in ipairs(candidateDirs) do
+			local unit = getHorizontalUnit(candidate)
+			if unit then
+				if not fallbackDir then
+					fallbackDir = unit
+				end
+
+				local clearance = estimateDirectionClearance(hrpRef.Position, unit, travelDistance, charRef)
+				local moveDistance = math.min(clearance, travelDistance)
+				local targetPos = hrpRef.Position + unit * moveDistance
+				local grounded = hasGroundSupportAtPosition(targetPos, charRef)
+
+				local score = moveDistance
+				score += math.max(0, (#candidateDirs - index)) * 0.75
+
+				if grounded then
+					score += 3
+				else
+					score -= 50
+				end
+
+				if clearance < SMART_DODGE_MIN_CLEARANCE then
+					score -= 100
+				end
+
+				if type(extraScoreFn) == "function" then
+					local ok, extra = pcall(extraScoreFn, unit, moveDistance, clearance, targetPos)
+					if ok and type(extra) == "number" then
+						score += extra
+					end
+				end
+
+				if not bestScore or score > bestScore then
+					bestScore = score
+					bestDir = unit
+				end
+			end
+		end
+
+		return bestDir or fallbackDir
+	end
+
+	local function performDirectionalDodge(direction, dodgeDuration, reasonText)
 		refreshCharacter()
 		if not char or not hrp or not humanoid then
 			dbg("Dodge skipped: missing char/hrp/humanoid")
@@ -436,6 +697,12 @@ do
 			return
 		end
 
+		local moveDir = getHorizontalUnit(direction)
+		if not moveDir then
+			dbg("Dodge skipped: invalid move direction")
+			return
+		end
+
 		local speed = getCurrentSpeed()
 		if speed < MIN_SPEED_TO_TRIGGER then
 			dbg("Dodge skipped: speed too low", speed)
@@ -444,12 +711,6 @@ do
 
 		if type(DODGE_MAX_SPEED) == "number" then
 			speed = math.min(speed, DODGE_MAX_SPEED)
-		end
-
-		local backward = getHorizontalUnit(-hrp.CFrame.LookVector)
-		if not backward then
-			dbg("Dodge skipped: no backward vector")
-			return
 		end
 
 		interruptActiveOverrides()
@@ -468,18 +729,20 @@ do
 
 		currentY = math.min(currentY, 0)
 
-		local newVel = Vector3.new(backward.X * speed, currentY, backward.Z * speed)
+		local newVel = Vector3.new(moveDir.X * speed, currentY, moveDir.Z * speed)
 
 		pcall(function()
 			hrpRef.AssemblyLinearVelocity = newVel
 		end)
 
 		local bv = Instance.new("BodyVelocity")
-		bv.Name = "AutoReflexBackwardDodge"
+		bv.Name = "AutoReflexDirectionalDodge"
 		bv.MaxForce = DODGE_FORCE_MAX
 		bv.P = DODGE_FORCE_P
 		bv.Velocity = newVel
 		bv.Parent = hrpRef
+
+		setDodgePopupVisible(true)
 
 		local info = nil
 
@@ -532,6 +795,153 @@ do
 		end)
 	end
 
+	local function performBackwardDodge(dodgeDuration, reasonText)
+		refreshCharacter()
+		if not hrp then
+			dbg("Backward dodge skipped: no HRP")
+			return
+		end
+
+		local backward = getHorizontalUnit(-hrp.CFrame.LookVector)
+		if not backward then
+			dbg("Backward dodge skipped: no backward vector")
+			return
+		end
+
+		performDirectionalDodge(backward, dodgeDuration, reasonText)
+	end
+
+	local function chooseSmartDodgeDirectionForSurvivor(survivor, dodgeDuration, mode)
+		refreshCharacter()
+		if not char or not hrp then
+			return nil
+		end
+
+		local sPos = getModelPosition(survivor)
+		if not sPos then
+			return nil
+		end
+
+		local root = getModelRootPart(survivor)
+
+		local speed = getCurrentSpeed()
+		if type(DODGE_MAX_SPEED) == "number" then
+			speed = math.min(speed, DODGE_MAX_SPEED)
+		end
+
+		local travelDistance = math.max(
+			SMART_DODGE_MIN_DISTANCE,
+			speed * (tonumber(dodgeDuration) or DODGE_DURATIONS.Default)
+		)
+
+		local awayFromSurvivor = getHorizontalUnit(hrp.Position - sPos)
+		local backward = getHorizontalUnit(-hrp.CFrame.LookVector)
+		local forward = getHorizontalUnit(hrp.CFrame.LookVector)
+
+		local candidateDirs = {}
+		local extraScoreFn = nil
+
+		local function pushDir(vec)
+			local unit = getHorizontalUnit(vec)
+			if unit then
+				table.insert(candidateDirs, unit)
+			end
+		end
+
+		if mode == "chance_beam" then
+			local beamDir = getHorizontalUnit(root and root.CFrame.LookVector or nil)
+			if not beamDir then
+				beamDir = getHorizontalUnit(sPos - hrp.Position) or forward or backward
+			end
+
+			local beamSide = getPerpendicularUnit(beamDir)
+
+			pushDir(beamSide)
+			if beamSide then pushDir(-beamSide) end
+			pushDir(awayFromSurvivor)
+			pushDir(backward)
+			if beamDir then pushDir(-beamDir) end
+			pushDir(forward)
+			if awayFromSurvivor then pushDir(-awayFromSurvivor) end
+		elseif mode == "jane_aim" then
+			local attackDir = getHorizontalUnit(root and root.CFrame.LookVector or nil)
+			if not attackDir then
+				attackDir = getHorizontalUnit(sPos - hrp.Position) or awayFromSurvivor or backward or forward
+			end
+
+			local attackSide = getPerpendicularUnit(attackDir)
+			local attackStart = sPos
+			local attackEnd = sPos + attackDir * JANE_ATTACK_RANGE
+
+			pushDir(attackSide)
+			if attackSide then pushDir(-attackSide) end
+			pushDir(-attackDir)
+			pushDir(awayFromSurvivor)
+			pushDir(backward)
+			pushDir(forward)
+			if awayFromSurvivor then pushDir(-awayFromSurvivor) end
+			pushDir(attackDir)
+
+			extraScoreFn = function(unit, moveDistance, clearance, targetPos)
+				local laneDistance = distancePointToSegmentXZ(targetPos, attackStart, attackEnd)
+				local currentLaneDistance = distancePointToSegmentXZ(hrp.Position, attackStart, attackEnd)
+				local score = laneDistance * 12
+
+				if laneDistance > currentLaneDistance then
+					score += 14
+				end
+
+				if laneDistance <= 1.0 then
+					score -= 150
+				elseif laneDistance <= 2.0 then
+					score -= 60
+				end
+
+				if getHorizontalUnit(unit) and attackSide then
+					local sideDot = math.abs(unit:Dot(attackSide))
+					score += sideDot * 12
+				end
+
+				if attackDir then
+					local backDot = unit:Dot(-attackDir)
+					score += math.max(0, backDot) * 4
+				end
+
+				if clearance < SMART_DODGE_MIN_CLEARANCE then
+					score -= 50
+				end
+
+				return score
+			end
+		else
+			local side = getPerpendicularUnit(awayFromSurvivor or backward or forward)
+
+			pushDir(awayFromSurvivor)
+			if side then
+				pushDir(side)
+				pushDir(-side)
+			end
+			pushDir(backward)
+			pushDir(forward)
+			if awayFromSurvivor then pushDir(-awayFromSurvivor) end
+		end
+
+		return chooseBestDodgeDirection(hrp, char, candidateDirs, travelDistance, extraScoreFn)
+			or awayFromSurvivor
+			or backward
+			or forward
+	end
+
+	local function performSmartSurvivorDodge(survivor, dodgeDuration, reasonText, mode)
+		local chosenDir = chooseSmartDodgeDirectionForSurvivor(survivor, dodgeDuration, mode)
+		if not chosenDir then
+			dbg("Smart dodge skipped: no direction found for", survivor and survivor.Name or "nil")
+			return
+		end
+
+		performDirectionalDodge(chosenDir, dodgeDuration, reasonText)
+	end
+
 	local function performInstantTurnTowardSurvivor(survivor, reasonText)
 		refreshCharacter()
 		if not char or not hrp or not humanoid then
@@ -557,7 +967,7 @@ do
 		end
 
 		local dist = (hrp.Position - sPos).Magnitude
-		if dist > DODGE_RANGE then
+		if dist > getTriggerRangeForSurvivor(survivor.Name) then
 			dbg("TwoTime turn skipped: out of range", dist)
 			return
 		end
@@ -574,7 +984,7 @@ do
 		end
 
 		lastDodgeTime = os.clock()
-		controller._pendingBackwardDodgeToken = nil
+		controller._pendingDodgeToken = nil
 
 		local offsetSign = (math.random(0, 1) == 0) and -1 or 1
 		local offsetDegrees = math.random(TWOTIME_TURN_MIN_OFFSET_DEGREES, TWOTIME_TURN_MAX_OFFSET_DEGREES) * offsetSign
@@ -653,7 +1063,7 @@ do
 		end)
 	end
 
-	local function scheduleTrackedBackwardDodge(survivor, delayTime, dodgeDuration, reasonText)
+	local function scheduleTrackedDodge(survivor, delayTime, dodgeDuration, reasonText, triggerRange, dodgeExecutor)
 		refreshCharacter()
 		if not hrp then
 			dbg("Schedule skipped: no HRP")
@@ -678,8 +1088,9 @@ do
 			return
 		end
 
+		local allowedRange = tonumber(triggerRange) or DODGE_RANGE
 		local dist = (hrp.Position - sPos).Magnitude
-		if dist > DODGE_RANGE then
+		if dist > allowedRange then
 			dbg("Schedule skipped: out of range", survivor.Name, dist)
 			return
 		end
@@ -692,14 +1103,14 @@ do
 		lastDodgeTime = os.clock()
 
 		local token = tostring(os.clock()) .. "_" .. tostring(math.random(1000, 9999))
-		controller._pendingBackwardDodgeToken = token
+		controller._pendingDodgeToken = token
 
 		dbg("Trigger detected for", survivor.Name, "reason:", reasonText or "unknown", "dist:", math.floor(dist))
 
 		task.delay(tonumber(delayTime) or 0, function()
 			if not running then return end
-			if controller._pendingBackwardDodgeToken ~= token then return end
-			controller._pendingBackwardDodgeToken = nil
+			if controller._pendingDodgeToken ~= token then return end
+			controller._pendingDodgeToken = nil
 
 			refreshCharacter()
 			if not hrp or not humanoid then
@@ -730,12 +1141,14 @@ do
 				return
 			end
 
-			if (hrp.Position - latestPos).Magnitude > DODGE_RANGE then
+			if (hrp.Position - latestPos).Magnitude > allowedRange then
 				dbg("Delayed dodge cancelled: moved out of range")
 				return
 			end
 
-			performBackwardDodge(dodgeDuration, reasonText)
+			if type(dodgeExecutor) == "function" then
+				dodgeExecutor(survivor, dodgeDuration, reasonText)
+			end
 		end)
 	end
 
@@ -760,12 +1173,27 @@ do
 					survivor,
 					survivor.Name .. " ResistanceStatus = " .. tostring(currentValue)
 				)
+			elseif survivor.Name == "JaneDoe" then
+				scheduleTrackedDodge(
+					survivor,
+					DODGE_DELAYS.JaneDoe or 0,
+					getDodgeDurationForSurvivor("JaneDoe"),
+					survivor.Name .. " ResistanceStatus = " .. tostring(currentValue),
+					getTriggerRangeForSurvivor("JaneDoe"),
+					function(target, duration, text)
+						performSmartSurvivorDodge(target, duration, text, "jane_aim")
+					end
+				)
 			else
-				scheduleTrackedBackwardDodge(
+				scheduleTrackedDodge(
 					survivor,
 					DODGE_DELAYS[survivor.Name] or 0,
 					getDodgeDurationForSurvivor(survivor.Name),
-					survivor.Name .. " ResistanceStatus = " .. tostring(currentValue)
+					survivor.Name .. " ResistanceStatus = " .. tostring(currentValue),
+					getTriggerRangeForSurvivor(survivor.Name),
+					function(_, duration, text)
+						performBackwardDodge(duration, text)
+					end
 				)
 			end
 		end
@@ -774,18 +1202,21 @@ do
 	local function handleChanceSurvivor(survivor)
 		if not survivor or survivor.Name ~= "Chance" then return end
 
-		local speedFolder = survivor:FindFirstChild("SpeedMultipliers")
-		local hasShootingGun = speedFolder and speedFolder:FindFirstChild("ShootingGun") ~= nil
+		local isTriggerPlayingNow = isAnimationPlaying(survivor, CHANCE_TRIGGER_ANIMATION_ID)
 
 		local prev = chanceState[survivor]
-		chanceState[survivor] = hasShootingGun
+		chanceState[survivor] = isTriggerPlayingNow
 
-		if hasShootingGun and not prev then
-			scheduleTrackedBackwardDodge(
+		if isTriggerPlayingNow and not prev then
+			scheduleTrackedDodge(
 				survivor,
 				DODGE_DELAYS.Chance or 0,
 				getDodgeDurationForSurvivor("Chance"),
-				"Chance ShootingGun"
+				"Chance animation " .. CHANCE_TRIGGER_ANIMATION_ID,
+				getTriggerRangeForSurvivor("Chance"),
+				function(target, duration, text)
+					performSmartSurvivorDodge(target, duration, text, "chance_beam")
+				end
 			)
 		end
 	end
@@ -828,11 +1259,15 @@ do
 			if not running then return end
 			refreshCharacter()
 			refreshSprintValue()
+			ensureDodgeGui()
+			setDodgePopupVisible(false)
 		end)
 	end))
 
 	refreshCharacter()
 	refreshSprintValue()
+	ensureDodgeGui()
+	setDodgePopupVisible(false)
 
 	table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 		if not running then return end
@@ -867,7 +1302,7 @@ do
 		local blocked = isNoDodgeBlocked()
 		if blocked and not lastBlockedState then
 			dbg("Blocked state entered")
-			controller._pendingBackwardDodgeToken = nil
+			controller._pendingDodgeToken = nil
 			interruptActiveOverrides()
 		end
 		lastBlockedState = blocked and true or false
@@ -887,11 +1322,20 @@ do
 
 		disconnectSprintWatcher()
 
-		controller._pendingBackwardDodgeToken = nil
+		controller._pendingDodgeToken = nil
 		resistanceState = {}
 		chanceState = {}
 
 		interruptActiveOverrides()
+		setDodgePopupVisible(false)
+
+		if dodgeGui and dodgeGui.Parent then
+			pcall(function()
+				dodgeGui:Destroy()
+			end)
+		end
+		dodgeGui = nil
+		dodgeLabel = nil
 
 		if _G.AutoReflexController == controller then
 			_G.AutoReflexController = nil
