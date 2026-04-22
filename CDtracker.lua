@@ -129,6 +129,9 @@ Supported TriggerType values in this version:
 	"AttributeNumberEquals"
 	"AttributeGroupEnds"
 	"AttributeIncreaseExcludingMove"
+	"GuestBlockByTimesHit"
+	"GuestChargeByAbilityIncrease"
+	"GuestPunchByTimesHitLowDamage"
 
 AnimationPlayed:
 	AnimationIds = { "id1", "id2", ... }
@@ -162,6 +165,22 @@ AttributeIncreaseExcludingMove:
 	When the numeric attribute increases, start cooldown,
 	UNLESS that increase matches the excluded move within the time window.
 
+GuestBlockByTimesHit:
+	AttributeName = "TimesHit"
+	Starts cooldown whenever that numeric attribute increases.
+
+GuestChargeByAbilityIncrease:
+	AttributeName = "AbilitiesUsed"
+	Starts cooldown when that numeric attribute increases,
+	UNLESS Block matched around the same time.
+	Also checks the configured resistance conditions before starting cooldown.
+
+GuestPunchByTimesHitLowDamage:
+	AttributeName = "TimesHit"
+	Shows the Punch box only when that numeric attribute increases
+	and the survivor loses less than the configured health threshold.
+	If the configured resistance value is detected, the Punch box is hidden again.
+
 Optional:
 	ShowUseCount = true
 ]]
@@ -173,18 +192,32 @@ local SURVIVOR_CONFIGS = {
 			{
 				Label = "Block",
 				Cooldown = 30,
-				TriggerType = "AttributeNumberEquals",
-				AttributeName = "HitboxPriority",
-				ExpectedValue = 3,
+				TriggerType = "GuestBlockByTimesHit",
+				AttributeName = "TimesHit",
 			},
 			{
 				Label = "Charge",
-				Cooldown = 40,
-				TriggerType = "AnimationPlayed",
-				AnimationIds = {
-					"106014898528300",
-					"74291573260497",
-				},
+				Cooldown = 39.7,
+				TriggerType = "GuestChargeByAbilityIncrease",
+				AttributeName = "AbilitiesUsed",
+				BlockMoveLabel = "Block",
+				BlockAttributeName = "HitboxPriority",
+				BlockValue = 3,
+				FolderName = "ResistanceMultipliers",
+				ValueObjectName = "ResistanceStatus",
+				AllowedWhenFolderEmpty = true,
+				AllowedResistanceValue = 100,
+			},
+			{
+				Label = "Punch",
+				Cooldown = 0,
+				TriggerType = "GuestPunchByTimesHitLowDamage",
+				AttributeName = "TimesHit",
+				HealthLossThreshold = 1,
+				FolderName = "ResistanceMultipliers",
+				ValueObjectName = "ResistanceStatus",
+				HideWhenValue = 40,
+				StartHidden = true,
 			},
 		},
 	},
@@ -459,6 +492,14 @@ local function isModelDead(model)
 	return false
 end
 
+local function getHumanoidHealth(model)
+	local hum = getHumanoid(model)
+	if hum then
+		return hum.Health
+	end
+	return nil
+end
+
 local function formatCooldownTime(secondsLeft)
 	secondsLeft = math.max(0, secondsLeft)
 	return string.format("%.1fs", secondsLeft)
@@ -543,6 +584,19 @@ local function readModelAttributeNumber(model, attributeName)
 
 	local n = tonumber(model:GetAttribute(attributeName))
 	return n
+end
+
+local function getFolderChildCount(model, folderName)
+	if not model then
+		return 0, nil
+	end
+
+	local folder = model:FindFirstChild(folderName or RESISTANCE_FOLDER_NAME)
+	if not folder then
+		return 0, nil
+	end
+
+	return #folder:GetChildren(), folder
 end
 
 --//======================================================
@@ -817,6 +871,7 @@ function Tracker.new(config, survivorModel)
 	self.GlobalConnections = {}
 	self.MoveStates = {}
 	self.LastMoveTriggeredAt = {}
+	self.LastKnownHealth = nil
 
 	for _, moveDef in ipairs(config.Moves) do
 		self.MoveStates[moveDef.Label] = {
@@ -826,6 +881,7 @@ function Tracker.new(config, survivorModel)
 			CooldownEnd = 0,
 			UseCount = 0,
 			ReadyFlashPlayed = false,
+			Hidden = moveDef.StartHidden == true,
 
 			ResistanceLatched = false,
 			BoolAttrLatched = false,
@@ -1014,6 +1070,19 @@ function Tracker:StartPrepCountdown(moveLabel, duration)
 	moveState.PrepEnd = time() + math.max(0, duration or 0)
 end
 
+function Tracker:SetMoveHidden(moveLabel, hidden)
+	local moveState = self.MoveStates[moveLabel]
+	if not moveState then
+		return
+	end
+
+	moveState.Hidden = hidden == true
+
+	if moveState.Box and moveState.Box.Outer then
+		moveState.Box.Outer.Visible = not moveState.Hidden
+	end
+end
+
 function Tracker:GetAnimationIdSetForMove(moveDef)
 	if moveDef._NormalizedAnimationIds then
 		return moveDef._NormalizedAnimationIds
@@ -1089,6 +1158,7 @@ end
 function Tracker:BindToSurvivor(survivorModel)
 	self.Survivor = survivorModel
 	self.Humanoid = getHumanoid(survivorModel)
+	self.LastKnownHealth = getHumanoidHealth(survivorModel)
 
 	self:CreateBillboard()
 
@@ -1250,12 +1320,168 @@ function Tracker:ProcessPendingAttributeIncreaseMoves()
 	end
 end
 
+function Tracker:EvaluateGuestBlockMoves()
+	for _, moveDef in ipairs(self.Config.Moves) do
+		if moveDef.TriggerType == "GuestBlockByTimesHit" then
+			local moveState = self.MoveStates[moveDef.Label]
+			local currentValue = readModelAttributeNumber(self.Survivor, moveDef.AttributeName)
+
+			if currentValue ~= nil then
+				if moveState.LastAttributeValue == nil then
+					moveState.LastAttributeValue = currentValue
+				elseif currentValue > moveState.LastAttributeValue then
+					local delta = currentValue - moveState.LastAttributeValue
+					for _ = 1, delta do
+						self:StartCooldown(moveDef.Label)
+					end
+					moveState.LastAttributeValue = currentValue
+				elseif currentValue < moveState.LastAttributeValue then
+					moveState.LastAttributeValue = currentValue
+				end
+			end
+		end
+	end
+end
+
+function Tracker:EvaluateGuestChargeMoves()
+	for _, moveDef in ipairs(self.Config.Moves) do
+		if moveDef.TriggerType == "GuestChargeByAbilityIncrease" then
+			local moveState = self.MoveStates[moveDef.Label]
+			local currentValue = readModelAttributeNumber(self.Survivor, moveDef.AttributeName)
+
+			if currentValue ~= nil then
+				if moveState.LastAttributeValue == nil then
+					moveState.LastAttributeValue = currentValue
+				elseif currentValue > moveState.LastAttributeValue then
+					local delta = currentValue - moveState.LastAttributeValue
+					local nowTime = time()
+
+					for _ = 1, delta do
+						table.insert(moveState.PendingAttributeEvents, {
+							Time = nowTime,
+						})
+					end
+
+					moveState.LastAttributeValue = currentValue
+				elseif currentValue < moveState.LastAttributeValue then
+					moveState.LastAttributeValue = currentValue
+				end
+			end
+		end
+	end
+end
+
+function Tracker:ProcessGuestChargeMoves()
+	local nowTime = time()
+
+	for _, moveDef in ipairs(self.Config.Moves) do
+		if moveDef.TriggerType == "GuestChargeByAbilityIncrease" then
+			local moveState = self.MoveStates[moveDef.Label]
+			local pending = moveState.PendingAttributeEvents
+			local kept = {}
+
+			for _, eventInfo in ipairs(pending) do
+				if nowTime - eventInfo.Time >= ATTRIBUTE_EVENT_DELAY then
+					local shouldSuppress = false
+					local blockLabel = moveDef.BlockMoveLabel
+					local blockTime = blockLabel and self.LastMoveTriggeredAt[blockLabel] or nil
+					if blockTime and math.abs(eventInfo.Time - blockTime) <= EXCLUDED_MOVE_MATCH_WINDOW then
+						shouldSuppress = true
+					end
+
+					local blockAttributeName = moveDef.BlockAttributeName
+					local blockValue = tonumber(moveDef.BlockValue)
+					if blockAttributeName and blockValue ~= nil then
+						local currentHitboxPriority = readModelAttributeNumber(self.Survivor, blockAttributeName)
+						if currentHitboxPriority ~= nil and currentHitboxPriority == blockValue then
+							shouldSuppress = true
+						end
+					end
+
+					local resistanceAllowed = false
+					local childCount = getFolderChildCount(self.Survivor, moveDef.FolderName or RESISTANCE_FOLDER_NAME)
+					local resistanceValue = readResistanceValue(
+						self.Survivor,
+						moveDef.FolderName or RESISTANCE_FOLDER_NAME,
+						moveDef.ValueObjectName or "ResistanceStatus"
+					)
+
+					if moveDef.AllowedWhenFolderEmpty and childCount == 0 then
+						resistanceAllowed = true
+					end
+
+					if resistanceValue ~= nil and resistanceValue == tonumber(moveDef.AllowedResistanceValue) then
+						resistanceAllowed = true
+					end
+
+					if not shouldSuppress and resistanceAllowed then
+						self:StartCooldown(moveDef.Label)
+					end
+				else
+					table.insert(kept, eventInfo)
+				end
+			end
+
+			moveState.PendingAttributeEvents = kept
+		end
+	end
+end
+
+function Tracker:EvaluateGuestPunchMoves()
+	local currentHealth = getHumanoidHealth(self.Survivor)
+
+	for _, moveDef in ipairs(self.Config.Moves) do
+		if moveDef.TriggerType == "GuestPunchByTimesHitLowDamage" then
+			local moveState = self.MoveStates[moveDef.Label]
+			local currentValue = readModelAttributeNumber(self.Survivor, moveDef.AttributeName)
+
+			if currentValue ~= nil then
+				if moveState.LastAttributeValue == nil then
+					moveState.LastAttributeValue = currentValue
+				elseif currentValue > moveState.LastAttributeValue then
+					local healthLoss = 0
+					if self.LastKnownHealth ~= nil and currentHealth ~= nil then
+						healthLoss = math.max(0, self.LastKnownHealth - currentHealth)
+					end
+
+					if healthLoss < tonumber(moveDef.HealthLossThreshold or 1) then
+						self:SetMoveHidden(moveDef.Label, false)
+					end
+
+					moveState.LastAttributeValue = currentValue
+				elseif currentValue < moveState.LastAttributeValue then
+					moveState.LastAttributeValue = currentValue
+				end
+			end
+
+			local hideWhenValue = tonumber(moveDef.HideWhenValue)
+			local resistanceValue = readResistanceValue(
+				self.Survivor,
+				moveDef.FolderName or RESISTANCE_FOLDER_NAME,
+				moveDef.ValueObjectName or "ResistanceStatus"
+			)
+
+			if resistanceValue ~= nil and hideWhenValue ~= nil and resistanceValue == hideWhenValue then
+				self:SetMoveHidden(moveDef.Label, true)
+			end
+		end
+	end
+end
+
 function Tracker:UpdateMoveVisual(moveState)
 	if not moveState or not moveState.Box then
 		return
 	end
 
 	local box = moveState.Box
+
+	if box.Outer then
+		box.Outer.Visible = not moveState.Hidden
+	end
+
+	if moveState.Hidden then
+		return
+	end
 
 	if box.SmallCountdown then
 		box.SmallCountdown.Visible = false
@@ -1350,10 +1576,16 @@ function Tracker:Update()
 	self:EvaluateAttributeGroupEndMoves()
 	self:EvaluateAttributeIncreaseMoves()
 	self:ProcessPendingAttributeIncreaseMoves()
+	self:EvaluateGuestBlockMoves()
+	self:EvaluateGuestChargeMoves()
+	self:ProcessGuestChargeMoves()
+	self:EvaluateGuestPunchMoves()
 
 	for _, moveState in pairs(self.MoveStates) do
 		self:UpdateMoveVisual(moveState)
 	end
+
+	self.LastKnownHealth = getHumanoidHealth(self.Survivor)
 end
 
 --//======================================================
