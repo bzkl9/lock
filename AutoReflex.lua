@@ -51,7 +51,7 @@ do
 
 	local DODGE_DURATIONS = {
 		Default = 0.35,
-		Shedletsky = 0.5,
+		Shedletsky = 0.3,
 		JaneDoe = 0.5,
 		Chance = 0.5,
 	}
