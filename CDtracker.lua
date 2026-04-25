@@ -129,7 +129,7 @@ Supported TriggerType values in this version:
 	"AttributeNumberEquals"
 	"AttributeGroupEnds"
 	"AttributeIncreaseExcludingMove"
-	"GuestBlockByTimesHit"
+	"GuestBlockBySpeedMultiplier"
 	"GuestChargeByAbilityIncrease"
 	"GuestPunchByTimesHitLowDamage"
 
@@ -165,9 +165,11 @@ AttributeIncreaseExcludingMove:
 	When the numeric attribute increases, start cooldown,
 	UNLESS that increase matches the excluded move within the time window.
 
-GuestBlockByTimesHit:
-	AttributeName = "TimesHit"
-	Starts cooldown whenever that numeric attribute increases.
+GuestBlockBySpeedMultiplier:
+	FolderName = "SpeedMultipliers"
+	ChildName = "GuestBlocking"
+	Starts cooldown when that child exists inside the configured folder.
+	It only triggers once while the child exists, then can trigger again after the child is removed and appears again.
 
 GuestChargeByAbilityIncrease:
 	AttributeName = "AbilitiesUsed"
@@ -192,8 +194,9 @@ local SURVIVOR_CONFIGS = {
 			{
 				Label = "Block",
 				Cooldown = 30,
-				TriggerType = "GuestBlockByTimesHit",
-				AttributeName = "TimesHit",
+				TriggerType = "GuestBlockBySpeedMultiplier",
+				FolderName = "SpeedMultipliers",
+				ChildName = "GuestBlocking",
 			},
 			{
 				Label = "Charge",
@@ -599,6 +602,19 @@ local function getFolderChildCount(model, folderName)
 	return #folder:GetChildren(), folder
 end
 
+local function hasNamedChildInFolder(model, folderName, childName)
+	if not model or not folderName or not childName then
+		return false
+	end
+
+	local folder = model:FindFirstChild(folderName)
+	if not folder then
+		return false
+	end
+
+	return folder:FindFirstChild(childName) ~= nil
+end
+
 --//======================================================
 --// VISUALS
 --//======================================================
@@ -887,6 +903,7 @@ function Tracker.new(config, survivorModel)
 			BoolAttrLatched = false,
 			NumberAttrLatched = false,
 			GroupWasActive = false,
+			SpeedChildLatched = false,
 
 			LastAttributeValue = nil,
 			PendingAttributeEvents = {},
@@ -1322,22 +1339,18 @@ end
 
 function Tracker:EvaluateGuestBlockMoves()
 	for _, moveDef in ipairs(self.Config.Moves) do
-		if moveDef.TriggerType == "GuestBlockByTimesHit" then
+		if moveDef.TriggerType == "GuestBlockBySpeedMultiplier" then
 			local moveState = self.MoveStates[moveDef.Label]
-			local currentValue = readModelAttributeNumber(self.Survivor, moveDef.AttributeName)
 
-			if currentValue ~= nil then
-				if moveState.LastAttributeValue == nil then
-					moveState.LastAttributeValue = currentValue
-				elseif currentValue > moveState.LastAttributeValue then
-					local delta = currentValue - moveState.LastAttributeValue
-					for _ = 1, delta do
-						self:StartCooldown(moveDef.Label)
-					end
-					moveState.LastAttributeValue = currentValue
-				elseif currentValue < moveState.LastAttributeValue then
-					moveState.LastAttributeValue = currentValue
-				end
+			local folderName = moveDef.FolderName or "SpeedMultipliers"
+			local childName = moveDef.ChildName or "GuestBlocking"
+			local matched = hasNamedChildInFolder(self.Survivor, folderName, childName)
+
+			if matched and not moveState.SpeedChildLatched then
+				self:StartCooldown(moveDef.Label)
+				moveState.SpeedChildLatched = true
+			elseif not matched then
+				moveState.SpeedChildLatched = false
 			end
 		end
 	end
