@@ -63,7 +63,7 @@ local function makeGui()
 	local frame = Instance.new("Frame")
 	-- moved to upper-left
 	frame.AnchorPoint = Vector2.new(0, 0)
-	frame.Position = UDim2.new(0, 120, 0, 328)
+	frame.Position = UDim2.new(0, 50, 0, 328)
 	frame.Size = UDim2.new(0, 520, 0, 86)
 	frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 	frame.BackgroundTransparency = 0.18
