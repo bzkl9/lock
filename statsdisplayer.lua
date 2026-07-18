@@ -23,6 +23,7 @@ end
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 if not LP then return end
@@ -120,6 +121,7 @@ end
 
 local ctrl = {
 	running = true,
+	visible = true, -- Press = to hide/show every stat display
 	conns = {},
 	perPlayer = {}, -- [player] = { charConn, humConn, diedConn, healthConn, ancestryConn, displayMode, bb, ui, adornee, humanoid }
 	accumStats = 0,
@@ -508,6 +510,7 @@ local function ensureModeDisplay(plr, pp)
 			local bb, data = createBillboardUI(plr.Character, tier)
 			if not bb or not data then return end
 			pp.bb = bb
+			pp.bb.Enabled = ctrl.visible
 			pp.adornee = data.adornee
 			pp.ui = data.ui
 			pp.displayMode = "BILLBOARD"
@@ -524,6 +527,7 @@ local function ensureModeDisplay(plr, pp)
 			local bb, data = createArrowUI(plr.Character, tier)
 			if not bb or not data then return end
 			pp.bb = bb
+			pp.bb.Enabled = ctrl.visible
 			pp.adornee = data.adornee
 			pp.ui = data
 			pp.displayMode = "ARROW"
@@ -571,6 +575,14 @@ end
 
 local function applyVisualScaling(plr, pp)
 	if not pp.bb or not pp.adornee or not pp.adornee.Parent then return end
+
+	-- Master visibility toggle. This check prevents the normal update loop
+	-- from turning displays back on while they are supposed to be hidden.
+	if not ctrl.visible then
+		pp.bb.Enabled = false
+		return
+	end
+
 	local cam = workspace.CurrentCamera
 	if not cam then return end
 
@@ -699,6 +711,29 @@ connect(Players.PlayerAdded, ensurePlayer)
 connect(Players.PlayerRemoving, removePlayer)
 
 --========================
+-- SHOW / HIDE TOGGLE (=)
+--========================
+connect(UserInputService.InputBegan, function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode ~= Enum.KeyCode.Equals then return end
+
+	ctrl.visible = not ctrl.visible
+
+	for plr, pp in pairs(ctrl.perPlayer) do
+		if pp.bb then
+			if ctrl.visible then
+				-- Restore the correct distance/mode visibility immediately.
+				applyVisualScaling(plr, pp)
+			else
+				pp.bb.Enabled = false
+			end
+		end
+	end
+
+	print("[StatShower] Displays " .. (ctrl.visible and "SHOWN" or "HIDDEN") .. " (= to toggle)")
+end)
+
+--========================
 -- MAIN LOOP
 --========================
 connect(RunService.Heartbeat, function(dt)
@@ -746,4 +781,4 @@ connect(RunService.Heartbeat, function(dt)
 	end
 end)
 
-print("[StatShower] Loaded. Lobby=billboard, Ingame=arrow(SurvivorWins). Tiers revamped.")
+print("[StatShower] Loaded. Press = to hide/show. Lobby=billboard, Ingame=arrow(SurvivorWins). Tiers revamped.")
