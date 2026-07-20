@@ -82,7 +82,7 @@ local SURVIVORS_PATH = {"Players", "Survivors"}
 local RESISTANCE_FOLDER_NAME = "ResistanceMultipliers"
 local BILLBOARD_NAME_PREFIX = "CDTracker_"
 
-local BOX_WORLD_SIZE = 4.5
+local BOX_WORLD_SIZE = 2.0
 local BOX_WORLD_GAP = 0.08
 local HEAD_GAP_STUDS = -10
 local MAX_DISTANCE = 200
