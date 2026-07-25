@@ -28,13 +28,17 @@ do
 	local DODGE_RANGE = 25
 	local MIN_SPEED_TO_TRIGGER = 0.2
 	local DODGE_FORCE_P = 1e4
-	local DODGE_FORCE_MAX = Vector3.new(1e5, 0, 1e5)
+	local DODGE_FORCE_MAX = Vector3.new(1e5, 1e5, 1e5)
 	local DODGE_MAX_SPEED = 21
 	local POLL_INTERVAL = 0.03
 
 	local GROUND_RAY_HEIGHT = 2.5
 	local GROUND_RAY_DISTANCE = 6
 	local AIR_CANCEL_GRACE = 0.05
+	local DODGE_GROUND_PROBE_PADDING = 1.25
+	local DODGE_GROUND_LOOKAHEAD = 1.25
+	local DODGE_GROUND_STICK_SPEED = 1.5
+	local DODGE_MAX_VERTICAL_SPEED = 18
 
 	local TWOTIME_TURN_MIN_OFFSET_DEGREES = 8
 	local TWOTIME_TURN_MAX_OFFSET_DEGREES = 20
@@ -53,7 +57,7 @@ do
 		Default = 0.35,
 		Shedletsky = 0.3,
 		JaneDoe = 0.4,
-		Chance = 0.4,
+		Chance = 0.8,
 	}
 
 	local TRIGGER_RANGES = {
@@ -259,6 +263,71 @@ do
 		end
 
 		return hasGroundSupportAtPosition(hrpRef.Position, charRef)
+	end
+
+	local function getDodgeGroundHit(hrpRef, humanoidRef, charRef, moveDir)
+		if not hrpRef or not hrpRef.Parent or not humanoidRef or not humanoidRef.Parent then
+			return nil
+		end
+
+		local rootHalfHeight = hrpRef.Size.Y * 0.5
+		local rootToFloor = math.max(0, humanoidRef.HipHeight) + rootHalfHeight
+		local maxGroundGap = rootToFloor + DODGE_GROUND_PROBE_PADDING
+		local castLift = 0.5
+		local params = buildRaycastParams(charRef)
+
+		local function castDown(position)
+			local origin = position + Vector3.new(0, castLift, 0)
+			local result = Workspace:Raycast(
+				origin,
+				Vector3.new(0, -(castLift + maxGroundGap), 0),
+				params
+			)
+
+			if result and position.Y - result.Position.Y <= maxGroundGap then
+				return result
+			end
+
+			return nil
+		end
+
+		-- Require support beneath the character itself. This prevents the long
+		-- general-purpose ground ray from treating a ledge several studs below
+		-- as if the character were still grounded.
+		local currentHit = castDown(hrpRef.Position)
+		if not currentHit then
+			return nil
+		end
+
+		-- Looking slightly ahead lets the velocity follow a changing slope
+		-- before the root part reaches the next patch of ground.
+		local forwardHit = castDown(hrpRef.Position + moveDir * DODGE_GROUND_LOOKAHEAD)
+		return forwardHit or currentHit
+	end
+
+	local function getGroundFollowingVelocity(moveDir, speed, groundNormal)
+		local normal = groundNormal
+		if typeof(normal) ~= "Vector3" or normal.Magnitude < 0.001 then
+			normal = Vector3.new(0, 1, 0)
+		else
+			normal = normal.Unit
+		end
+
+		local alongGround = moveDir - normal * moveDir:Dot(normal)
+		if alongGround.Magnitude < 0.001 then
+			alongGround = moveDir
+		else
+			alongGround = alongGround.Unit
+		end
+
+		local velocity = alongGround * speed
+		local vertical = math.clamp(
+			velocity.Y - DODGE_GROUND_STICK_SPEED,
+			-DODGE_MAX_VERTICAL_SPEED,
+			DODGE_MAX_VERTICAL_SPEED
+		)
+
+		return Vector3.new(velocity.X, vertical, velocity.Z)
 	end
 
 	local function extractAnimationId(rawId)
@@ -498,6 +567,21 @@ do
 
 		info.finished = true
 
+		-- A rising slope can leave a positive Y velocity on the root part.
+		-- Remove that launch velocity as soon as the dodge stops.
+		if info.hrp and info.hrp.Parent then
+			pcall(function()
+				local velocity = info.hrp.AssemblyLinearVelocity
+				if velocity.Y > 0 then
+					info.hrp.AssemblyLinearVelocity = Vector3.new(
+						velocity.X,
+						0,
+						velocity.Z
+					)
+				end
+			end)
+		end
+
 		if controller._activeDodge == info then
 			controller._activeDodge = nil
 		end
@@ -722,14 +806,18 @@ do
 
 		humanoidRef.AutoRotate = false
 
-		local currentY = 0
-		pcall(function()
-			currentY = hrpRef.AssemblyLinearVelocity.Y
-		end)
+		local initialGroundHit = getDodgeGroundHit(hrpRef, humanoidRef, charRef, moveDir)
+		local newVel
 
-		currentY = math.min(currentY, 0)
-
-		local newVel = Vector3.new(moveDir.X * speed, currentY, moveDir.Z * speed)
+		if initialGroundHit then
+			newVel = getGroundFollowingVelocity(moveDir, speed, initialGroundHit.Normal)
+		else
+			local currentY = 0
+			pcall(function()
+				currentY = hrpRef.AssemblyLinearVelocity.Y
+			end)
+			newVel = Vector3.new(moveDir.X * speed, math.min(currentY, 0), moveDir.Z * speed)
+		end
 
 		pcall(function()
 			hrpRef.AssemblyLinearVelocity = newVel
@@ -737,7 +825,9 @@ do
 
 		local bv = Instance.new("BodyVelocity")
 		bv.Name = "AutoReflexDirectionalDodge"
-		bv.MaxForce = DODGE_FORCE_MAX
+		bv.MaxForce = initialGroundHit
+			and DODGE_FORCE_MAX
+			or Vector3.new(DODGE_FORCE_MAX.X, 0, DODGE_FORCE_MAX.Z)
 		bv.P = DODGE_FORCE_P
 		bv.Velocity = newVel
 		bv.Parent = hrpRef
@@ -757,14 +847,32 @@ do
 				return
 			end
 
-			if hasGroundSupportFor(hrpRef, humanoidRef, charRef) then
+			local groundHit = getDodgeGroundHit(hrpRef, humanoidRef, charRef, moveDir)
+			if groundHit then
 				info.airLostAt = nil
+				bv.MaxForce = DODGE_FORCE_MAX
+				bv.Velocity = getGroundFollowingVelocity(moveDir, speed, groundHit.Normal)
 				return
 			end
 
 			if not info.airLostAt then
 				info.airLostAt = os.clock()
-				return
+
+				-- Stop controlling Y immediately so gravity takes over. Also
+				-- cancel any upward slope velocity before it becomes a launch.
+				bv.MaxForce = Vector3.new(DODGE_FORCE_MAX.X, 0, DODGE_FORCE_MAX.Z)
+				bv.Velocity = Vector3.new(moveDir.X * speed, 0, moveDir.Z * speed)
+
+				pcall(function()
+					local velocity = hrpRef.AssemblyLinearVelocity
+					if velocity.Y > 0 then
+						hrpRef.AssemblyLinearVelocity = Vector3.new(
+							velocity.X,
+							0,
+							velocity.Z
+						)
+					end
+				end)
 			end
 
 			if os.clock() - info.airLostAt >= AIR_CANCEL_GRACE then
