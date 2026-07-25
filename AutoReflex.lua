@@ -34,7 +34,6 @@ do
 
 	local GROUND_RAY_HEIGHT = 2.5
 	local GROUND_RAY_DISTANCE = 6
-	local AIR_CANCEL_GRACE = 0.05
 	local DODGE_GROUND_PROBE_PADDING = 1.25
 	local DODGE_GROUND_LOOKAHEAD = 1.25
 	local DODGE_GROUND_STICK_SPEED = 1.5
@@ -291,16 +290,11 @@ do
 			return nil
 		end
 
-		-- Require support beneath the character itself. This prevents the long
-		-- general-purpose ground ray from treating a ledge several studs below
-		-- as if the character were still grounded.
 		local currentHit = castDown(hrpRef.Position)
 		if not currentHit then
 			return nil
 		end
 
-		-- Looking slightly ahead lets the velocity follow a changing slope
-		-- before the root part reaches the next patch of ground.
 		local forwardHit = castDown(hrpRef.Position + moveDir * DODGE_GROUND_LOOKAHEAD)
 		return forwardHit or currentHit
 	end
@@ -567,8 +561,7 @@ do
 
 		info.finished = true
 
-		-- A rising slope can leave a positive Y velocity on the root part.
-		-- Remove that launch velocity as soon as the dodge stops.
+		-- Do not keep upward momentum created while following an uphill slope.
 		if info.hrp and info.hrp.Parent then
 			pcall(function()
 				local velocity = info.hrp.AssemblyLinearVelocity
@@ -858,11 +851,7 @@ do
 			if not info.airLostAt then
 				info.airLostAt = os.clock()
 
-				-- Stop controlling Y immediately so gravity takes over. Also
-				-- cancel any upward slope velocity before it becomes a launch.
-				bv.MaxForce = Vector3.new(DODGE_FORCE_MAX.X, 0, DODGE_FORCE_MAX.Z)
-				bv.Velocity = Vector3.new(moveDir.X * speed, 0, moveDir.Z * speed)
-
+				-- Cancel upward slope momentum once, but do not end the dodge.
 				pcall(function()
 					local velocity = hrpRef.AssemblyLinearVelocity
 					if velocity.Y > 0 then
@@ -875,10 +864,10 @@ do
 				end)
 			end
 
-			if os.clock() - info.airLostAt >= AIR_CANCEL_GRACE then
-				dbg("Dodge cut short: lost ground support")
-				endActiveDodge(info)
-			end
+			-- Preserve the full requested dodge duration. Only Y control is
+			-- released here, so Roblox gravity resumes while X/Z keeps dodging.
+			bv.MaxForce = Vector3.new(DODGE_FORCE_MAX.X, 0, DODGE_FORCE_MAX.Z)
+			bv.Velocity = Vector3.new(moveDir.X * speed, 0, moveDir.Z * speed)
 		end)
 
 		info = {
