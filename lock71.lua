@@ -1,6 +1,27 @@
 
 -- Aim Assist — Post-windup only recording (FULL-FILE) — LAST-DIRECTION + FIXED LATERAL
 -- Updated: ignore trivial pushes removed; robust direction detection, logging + hysteresis + temporary immediate trend + regression ensemble for short windows
+--
+-- Heads-up when copying this file manually:
+--   • The script is ~1.5k lines long (check `wc -l lock71.lua`). Some copy/paste
+--     paths silently truncate around 700–800 lines, so you may end up with a
+--     partial script unless you split the copy into chunks or pull the file
+--     directly from disk/version control.
+--   • If your editor shows fewer than ~1,500 lines after pasting, fetch the
+--     file again instead of running the truncated version; incomplete copies
+--     will break the aim logic.
+--   • For step-by-step approval or deployment guidance, see `APPLYING_CHANGES.md`.
+
+local function disconnectList(list)
+    if not list then return end
+    for _, c in ipairs(list) do
+        pcall(function()
+            if c and type(c.Disconnect) == "function" then
+                c:Disconnect()
+            end
+        end)
+    end
+end
 
 -- Kill previous instance (robust)
 if _G.AimAssistKill and type(_G.AimAssistKill) == "function" then
@@ -12,18 +33,12 @@ _G.AimAssistKill = function()
         pcall(function() _G.AimAssistConn:Disconnect() end)
         _G.AimAssistConn = nil
     end
-    if _G.AimAssistAnimConns then
-        for _,c in ipairs(_G.AimAssistAnimConns) do
-            pcall(function() if c and type(c.Disconnect) == "function" then c:Disconnect() end end)
-        end
-        _G.AimAssistAnimConns = nil
-    end
-    if _G.AimAssistActiveRecordConns then
-        for _,c in ipairs(_G.AimAssistActiveRecordConns) do
-            pcall(function() if c and type(c.Disconnect) == "function" then c:Disconnect() end end)
-        end
-        _G.AimAssistActiveRecordConns = nil
-    end
+
+    disconnectList(_G.AimAssistAnimConns)
+    disconnectList(_G.AimAssistActiveRecordConns)
+    _G.AimAssistAnimConns = nil
+    _G.AimAssistActiveRecordConns = nil
+
     if _G.AimAssistGui and _G.AimAssistGui.Parent then
         pcall(function() _G.AimAssistGui:Destroy() end)
         _G.AimAssistGui = nil
@@ -45,8 +60,6 @@ _G.AimAssistKill = function()
     _G.AimAssistLockedHighlight = nil
     _G.AimAssistLockedBillboard = nil
     _G.AimAssistRedHighlight = nil
-    _G.AimAssistActiveRecordConns = nil
-    _G.AimAssistAnimConns = nil
     _G.AimAssistGui = nil
     _G.AimAssistKill = nil
 end
@@ -60,6 +73,10 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local Camera = workspace.CurrentCamera
 local Mouse = LocalPlayer:GetMouse()
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+rayParams.IgnoreWater = true
 
 -- GUI (small)
 local screenGui = Instance.new("ScreenGui")
@@ -139,6 +156,13 @@ local POST_EDGE_WINDOW = 0.18
 local EWMA_ALPHA = 0.25
 local PRE_RECORD_WINDOW = 0.18
 local VEL_DIR_THRESHOLD = 0.6
+
+local DEBUG_LOGS_ENABLED = false
+local function debugWarn(...)
+    if DEBUG_LOGS_ENABLED then
+        warn(...)
+    end
+end
 
 -- Minimum absolute lateral dodge (studs) required for a post‑windup recording
 -- to be considered significant.  Dodges smaller than this value are more
@@ -348,14 +372,29 @@ end
 
 local function findNearestTarget()
     local closest, dist = nil, math.huge
+    local mousePos = Vector2.new(Mouse.X, Mouse.Y)
+    local camPos = Camera.CFrame.Position
     for _,v in ipairs(Players:GetPlayers()) do
         if v ~= LocalPlayer and v.Character and v.Character.Parent then
-            local center = computeTargetCenter(v.Character)
-            if center then
-                local screenPos, onScreen = Camera:WorldToViewportPoint(center)
-                if onScreen then
-                    local mag = (Vector2.new(Mouse.X,Mouse.Y) - Vector2.new(screenPos.X,screenPos.Y)).Magnitude
-                    if mag < dist then dist = mag; closest = v.Character end
+            local character = v.Character
+            local hrp = character:FindFirstChild("HumanoidRootPart")
+            local hum = character:FindFirstChild("Humanoid")
+            if hrp and hum and hum.Health > 0 then
+                local center = computeTargetCenter(character)
+                if center then
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(center)
+                    if onScreen then
+                        local ignoreList = {character}
+                        local lpChar = LocalPlayer.Character
+                        if lpChar then table.insert(ignoreList, lpChar) end
+                        rayParams.FilterDescendantsInstances = ignoreList
+                        local dir = center - camPos
+                        local hit = workspace:Raycast(camPos, dir, rayParams)
+                        if not hit or (hit.Instance and hit.Instance:IsDescendantOf(character)) then
+                            local mag = (mousePos - Vector2.new(screenPos.X, screenPos.Y)).Magnitude
+                            if mag < dist then dist = mag; closest = character end
+                        end
+                    end
                 end
             end
         end
@@ -539,7 +578,7 @@ local function startPostWindupRecording(targetChar, key)
             for i=#activeRecordConns,1,-1 do if activeRecordConns[i] == conn then table.remove(activeRecordConns,i) end end
 
             if #samples == 0 then
-                warn(("[AimAssist] post-record EMPTY uid=%d key=%s"):format(uid,key))
+                debugWarn(("[AimAssist] post-record EMPTY uid=%d key=%s"):format(uid,key))
                 return
             end
 
@@ -711,7 +750,7 @@ local function startPostWindupRecording(targetChar, key)
             if counted and (math.abs(peakDelta) >= immediateThreshold or slopeScore >= immediateThreshold) then
                 profAll.temporaryTrend = newTrendName
                 profAll.temporaryTrendExpiry = tick() + TEMPORARY_TREND_DURATION
-                warn(("[AimAssist] TEMP TREND uid=%d key=%s trend=%s peak=%.2f slope=%.2f expiry=%.2f"):format(uid, key, newTrendName, peakDelta, slopeTotal, profAll.temporaryTrendExpiry))
+                debugWarn(("[AimAssist] TEMP TREND uid=%d key=%s trend=%s peak=%.2f slope=%.2f expiry=%.2f"):format(uid, key, newTrendName, peakDelta, slopeTotal, profAll.temporaryTrendExpiry))
             end
 
             if finalDecision ~= 0 and counted then
@@ -803,7 +842,7 @@ local function startPostWindupRecording(targetChar, key)
                 local countedStr = counted and "YES" or "NO"
                 local prevTrendStr = prevTrend or "nil"
                 local afterTrendStr = profAll.lastTrend or "nil"
-                warn(("[AimAssist][DET] uid=%d key=%s baseline=%.3f peakDelta=%.3f raw=%.3f slope=%.3f last=%.3f pos=%d neg=%d sig=%d vote=%s combined=%.3f decided=%s counted=%s prevTrend=%s->%s stable=%d")
+                debugWarn(("[AimAssist][DET] uid=%d key=%s baseline=%.3f peakDelta=%.3f raw=%.3f slope=%.3f last=%.3f pos=%d neg=%d sig=%d vote=%s combined=%.3f decided=%s counted=%s prevTrend=%s->%s stable=%d")
                     :format(uid, key, baseline, peakDelta, rawDelta, slopeTotal, lastAvg, posCount, negCount, significantCount,
                         (voteDecision==1 and "Right" or (voteDecision==-1 and "Left" or "None")),
                         combinedScore, decidedStr, countedStr, prevTrendStr, afterTrendStr, profAll.trendStableCount or 0))
@@ -1039,7 +1078,7 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
     if rawLead.Magnitude > maxLead and rawLead.Magnitude > 0 then
         rawLead = rawLead.Unit * maxLead
         if RunService:IsStudio() then
-            warn(("[AimAssist] lead clamped owner=%s distance=%.2f rawLead=%.2f maxLead=%.2f"):format(tostring(Players:GetPlayerFromCharacter(targetChar) and Players:GetPlayerFromCharacter(targetChar).Name or "nil"), distance, (vel * t * effectiveBoost).Magnitude, maxLead))
+            debugWarn(("[AimAssist] lead clamped owner=%s distance=%.2f rawLead=%.2f maxLead=%.2f"):format(tostring(Players:GetPlayerFromCharacter(targetChar) and Players:GetPlayerFromCharacter(targetChar).Name or "nil"), distance, (vel * t * effectiveBoost).Magnitude, maxLead))
         end
     end
     local predicted = center + rawLead
@@ -1151,7 +1190,7 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
                     lateralApplied = -FIXED_LATERAL
                 end
                 if owner then
-                    warn(("[AimAssist] USING TEMP TREND uid=%d trend=%s expiry=%.2f"):format(owner.UserId, profAll.temporaryTrend, profAll.temporaryTrendExpiry))
+                    debugWarn(("[AimAssist] USING TEMP TREND uid=%d trend=%s expiry=%.2f"):format(owner.UserId, profAll.temporaryTrend, profAll.temporaryTrendExpiry))
                 end
             elseif profAll.lastTrend == "Right" then
                 lateralApplied = FIXED_LATERAL
@@ -1170,7 +1209,7 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
             -- positive), we aim left, and vice versa.
             lateralApplied = -dominantPreDir * FIXED_LATERAL
             if owner then
-                warn(("[AimAssist] PREWINDUP Q PATTERN uid=%d dominantDir=%s applied lateral=%.2f"):format(owner.UserId, tostring(dominantPreDir), lateralApplied))
+                debugWarn(("[AimAssist] PREWINDUP Q PATTERN uid=%d dominantDir=%s applied lateral=%.2f"):format(owner.UserId, tostring(dominantPreDir), lateralApplied))
             end
         else
             -- non-adapt path: keep the small lateral velocity nudge (this is small by design)
@@ -1203,7 +1242,7 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
             if math.abs(lateralApplied) > 0 then
                 lateralApplied = -lateralApplied
                 if owner then
-                    warn(("[AimAssist] WINDUP OPPOSITE uid=%d lateralRaw=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft))
+                    debugWarn(("[AimAssist] WINDUP OPPOSITE uid=%d lateralRaw=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft))
                 end
             else
                 -- if we computed zero lateral but have historical adapt, try
@@ -1214,7 +1253,7 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
                     if math.abs(comp) > 0 then
                         lateralApplied = -comp
                         if owner then
-                            warn(("[AimAssist] WINDUP OPPOSITE fallback uid=%d comp=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft))
+                            debugWarn(("[AimAssist] WINDUP OPPOSITE fallback uid=%d comp=%.2f timeLeft=%.3f"):format(owner.UserId, lateralApplied, timeLeft))
                         end
                     end
                 end
@@ -1228,7 +1267,7 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
             if math.abs(lateralApplied) > 0 then
                 predicted = predicted + rightDir * (lateralApplied * scaleFactor)
                 if owner then
-                    warn(("[AimAssist] WINDUP SNAP uid=%d lateral=%.2f (scaled=%.2f) timeLeft=%.3f"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), timeLeft))
+                    debugWarn(("[AimAssist] WINDUP SNAP uid=%d lateral=%.2f (scaled=%.2f) timeLeft=%.3f"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), timeLeft))
                 end
             end
             return predicted
@@ -1252,14 +1291,19 @@ local function predictedAimPoint(myPos, targetChar, chargeKey, forceSnap, allowA
     if math.abs(lateralApplied) > 0 then
         blended = blended + rightDir * (lateralApplied * scaleFactor)
         if owner then
-            warn(("[AimAssist] ADAPT APPLY uid=%d lateral=%.2f scaled=%.2f lastTrend=%s"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), (profAll.lastTrend or "nil")))
+            debugWarn(("[AimAssist] ADAPT APPLY uid=%d lateral=%.2f scaled=%.2f lastTrend=%s"):format(owner.UserId, lateralApplied, (lateralApplied * scaleFactor), (profAll.lastTrend or "nil")))
         end
     end
 
-    -- stronger smoothing so changes are visible but still smooth (was 0.55, now 0.85)
+    -- adaptive smoothing: prioritize reactivity for fast/far targets while keeping
+    -- slow targets steady.  Faster targets get higher alpha (closer to predicted),
+    -- slower ones keep more smoothing.
     if targetChar then
         lastPredictions[targetChar] = lastPredictions[targetChar] or blended
-        lastPredictions[targetChar] = lastPredictions[targetChar]:Lerp(blended, 0.85)
+        local speedFactor = math.clamp(targetSpeed / 30, 0, 1)
+        local distanceFactor = math.clamp(distance / 80, 0, 1)
+        local smoothingAlpha = math.clamp(0.55 + 0.35 * math.max(speedFactor, distanceFactor), 0.55, 0.95)
+        lastPredictions[targetChar] = lastPredictions[targetChar]:Lerp(blended, smoothingAlpha)
         return lastPredictions[targetChar]
     end
 
@@ -1341,7 +1385,7 @@ local function onCharacterAnimationPlayed(character)
                 if p and p.lastCast and p.lastCast.t == profAll.lastCast.t then
                     p.isCasting = false
                     p.lastCast = nil
-                    warn(("[AimAssist] lastCast cleared uid=%d key=%s"):format(owner.UserId, key))
+                    debugWarn(("[AimAssist] lastCast cleared uid=%d key=%s"):format(owner.UserId, key))
                 end
             end)
         end)
@@ -1349,7 +1393,7 @@ local function onCharacterAnimationPlayed(character)
         -- schedule the post-windup recording AFTER the cast/windup expires (no in-windup samples)
         schedulePostWindupRecording(character, key, profAll.lastCast.expires)
 
-        warn(("[AimAssist] noted animation uid=%d key=%s duration=%.2f expires=%.2f (post-record scheduled)"):format(owner.UserId, key, duration, profAll.lastCast.expires))
+        debugWarn(("[AimAssist] noted animation uid=%d key=%s duration=%.2f expires=%.2f (post-record scheduled)"):format(owner.UserId, key, duration, profAll.lastCast.expires))
     end)
     table.insert(animConns, conn); _G.AimAssistAnimConns = animConns
 end
@@ -1568,8 +1612,8 @@ end)
 
 -- debug
 if RunService:IsStudio() then
-    warn("[AimAssist] Post-windup recording loaded. POST_RECORD_DURATION="..tostring(POST_RECORD_DURATION).." FIXED_LATERAL="..tostring(FIXED_LATERAL).." POST_EDGE_WINDOW="..tostring(POST_EDGE_WINDOW))
-    warn(("[AimAssist] DETUNING: MIN_MOVE_MAG=%.2f DIR_THRESHOLD=%.2f SMALL_DELTA_THRESHOLD=%.2f HYST=%d STALE=%.1fs")
-         :format(MIN_MOVE_MAG, DIR_THRESHOLD, SMALL_DELTA_THRESHOLD, HYSTERESIS_REQUIRED, STALE_TREND_TIMEOUT))
-    warn(("[AimAssist] TEMP TREND CONFIG: IMMEDIATE_MIN_PEAK=%.2f DURATION=%.2fs PRE_SNAP_TIME=%.2fs MAX_LEAD_ABS=%.2f MAX_LEAD_FRAC=%.2f"):format(IMMEDIATE_TREND_MIN_PEAK, TEMPORARY_TREND_DURATION, PRE_SNAP_TIME, MAX_LEAD_ABS, MAX_LEAD_FRACTION))
+    debugWarn("[AimAssist] Post-windup recording loaded. POST_RECORD_DURATION="..tostring(POST_RECORD_DURATION).." FIXED_LATERAL="..tostring(FIXED_LATERAL).." POST_EDGE_WINDOW="..tostring(POST_EDGE_WINDOW))
+    debugWarn(("[AimAssist] DETUNING: MIN_MOVE_MAG=%.2f DIR_THRESHOLD=%.2f SMALL_DELTA_THRESHOLD=%.2f HYST=%d STALE=%.1fs")
+        :format(MIN_MOVE_MAG, DIR_THRESHOLD, SMALL_DELTA_THRESHOLD, HYSTERESIS_REQUIRED, STALE_TREND_TIMEOUT))
+    debugWarn(("[AimAssist] TEMP TREND CONFIG: IMMEDIATE_MIN_PEAK=%.2f DURATION=%.2fs PRE_SNAP_TIME=%.2fs MAX_LEAD_ABS=%.2f MAX_LEAD_FRAC=%.2f"):format(IMMEDIATE_TREND_MIN_PEAK, TEMPORARY_TREND_DURATION, PRE_SNAP_TIME, MAX_LEAD_ABS, MAX_LEAD_FRACTION))
 end
