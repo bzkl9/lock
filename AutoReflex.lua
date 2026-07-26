@@ -49,14 +49,14 @@ do
 	local DODGE_DELAYS = {
 		Shedletsky = 0.2,
 		JaneDoe = 0.1,
-		Chance = 0.4,
+		Chance = 0.8,
 	}
 
 	local DODGE_DURATIONS = {
 		Default = 0.35,
 		Shedletsky = 0.3,
 		JaneDoe = 0.4,
-		Chance = 0.8,
+		Chance = 0.4,
 	}
 
 	local TRIGGER_RANGES = {
