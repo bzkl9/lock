@@ -64,7 +64,7 @@ local CONFIG = {
 	},    -- true = no sticking while shift lock is on
 
 	STICK_DETECT_DISTANCE = 3.5,   -- walls closer than this (from your center) can be stuck to
-	DESIRED_WALL_DISTANCE = 1.5,   -- your center is kept this far from the wall
+	DESIRED_WALL_DISTANCE = 1.2,   -- your center is kept this far from the wall
 	LEAVE_DOT = 0.3,               -- steering away from the wall more than this (~17 degrees) lets go
 	MIN_ALONG = 0.15,              -- you must be moving at least a little along the wall (or into it)
 	DISTANCE_GAIN = 1.2,           -- how hard it pulls/pushes you to DESIRED_WALL_DISTANCE
