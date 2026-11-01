@@ -1,3 +1,36 @@
+--[[
+	AutoWallStick (enhanced)
+
+	Just sticks you close to walls while you move along them. You steer, it keeps you DESIRED_DISTANCE
+	from the wall.
+
+	  * Move along a wall (or into it at an angle): you slide along it at DESIRED_DISTANCE.
+	  * Outside corners: it wraps you tightly round the edge; once you're past it and still steering
+	    straight on, it lets go (turn toward the new face to keep following it).
+	    Inside corners: you slide onto the new wall in whichever direction you're steering along it
+	    (steering straight into the corner just stops you there).
+	  * Something in the way along the wall (a bin, a crate, a pillar): it moves your line out just far
+	    enough to get past it, then back in to the wall once you're past. It looks LOOKAHEAD_TIME ahead,
+	    picks the smallest offset (DETOUR_STEP steps, up to MAX_DETOUR) whose line is clear for your body,
+	    and keeps following the same wall while it does. Short things count too (anything taller than you
+	    can step over). No route planning, just the line ahead of you.
+	  * Steer away from the wall (more than LEAVE_DOT) and it lets you go.
+	  * Works in shift lock too (set SHIFTLOCK_DISABLES = true if you want shift lock to turn it off).
+	  * Z: on/off.
+
+	What changed from the original
+	  * Steers through your normal movement instead of teleporting the HumanoidRootPart every frame
+	    (no stutter, no clipping into walls, physics and animations stay normal).
+	  * Finds the closest point of the nearest wall all around you, not just left/right of where your
+	    character faces, so it sees corners and walls in front of you.
+	  * Only real walls count: steep (anything you can walk up is floor), tall (checked at two heights, so
+	    stairs, curbs and short blocks are ignored) and not a character.
+	  * Doesn't flip between two walls in a corridor (keeps the one it's on unless another is clearly closer).
+	  * Reuses one set of raycast settings instead of making new ones every ray.
+	  * IGNORE_PATHS: folders whose parts are ignored completely (KillerDoors by default).
+
+	Tweak live: _G.AutoWallStickController.Config.DESIRED_WALL_DISTANCE = 1.3
+]]
 do
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -6,294 +39,392 @@ local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 if not player then return end
 
-if _G.AutoWallStickController and type(_G.AutoWallStickController.Cleanup) == "function" then
-    pcall(function() _G.AutoWallStickController.Cleanup() end)
-    _G.AutoWallStickController = nil
+for _, key in ipairs({ "AutoWallStickController", "WallCirclerSimpleController", "WallCirclerController",
+	"AutoPathController", "PathAssistController" }) do
+	local old = _G[key]
+	if type(old) == "table" and type(old.Cleanup) == "function" then
+		pcall(old.Cleanup)
+	end
+	_G[key] = nil
 end
 
 local controller = {}
 _G.AutoWallStickController = controller
 
-local STICK_DETECT_DISTANCE = 3.5
-local DESIRED_WALL_DISTANCE = 1.5
-local STICK_LERP_SPEED = 23
-local AGGRESSIVE_LERP_SPEED = 40
-local MIN_MOVE_TO_STICK = 0.01
-local WALL_NORMAL_Y_THRESHOLD = 0.82
-local ALLOW_STICK_ANGLE = 0.85
-local LEAVE_THRESHOLD = -0.25
-local RAY_HEIGHTS = {0.6, 1.4, 2.0}
-local FORWARD_OFFSETS = {-0.6, 0, 0.6}
-local SIDE_SAMPLE_RADIUS = 0.35
-local GRACE_KEEP_SECONDS = 0.12
-local MIN_HIT_COUNT_TO_ACCEPT = 2
-local SAMPLES_PER_SIDE = #RAY_HEIGHTS * #FORWARD_OFFSETS
-local OBSTACLE_LOOKAHEAD_MULT = 0.7
-local AVOID_SHIFT_AMOUNT = 1.2
-local MAX_OBSTACLE_RETRY = 0.3
-local MAX_SHIFT_PER_FRAME = 2.5
+------------------------------------------------------------------------
+-- CONFIG
+------------------------------------------------------------------------
+local CONFIG = {
+	TOGGLE_KEY = Enum.KeyCode.Z,
+	SHIFTLOCK_DISABLES = false,
 
-local running = true
+	-- folders (paths from Workspace) whose parts are completely ignored: never stuck to, never avoided
+	IGNORE_PATHS = {
+		{ "Map", "Ingame", "Map", "MapBoundaries", "KillerDoors" },
+	},    -- true = no sticking while shift lock is on
+
+	STICK_DETECT_DISTANCE = 3.5,   -- walls closer than this (from your center) can be stuck to
+	DESIRED_WALL_DISTANCE = 1.5,   -- your center is kept this far from the wall
+	LEAVE_DOT = 0.3,               -- steering away from the wall more than this (~17 degrees) lets go
+	MIN_ALONG = 0.15,              -- you must be moving at least a little along the wall (or into it)
+	DISTANCE_GAIN = 1.2,           -- how hard it pulls/pushes you to DESIRED_WALL_DISTANCE
+	MAX_CORRECTION = 1.0,
+	STEER_SMOOTHING = 0.04,        -- seconds
+	GRACE_KEEP_SECONDS = 0.12,     -- keep the last wall this long if it's briefly not seen
+	SWITCH_MARGIN = 0.5,           -- another wall must be this much closer to switch to it
+
+	-- getting past things along the wall
+	AVOID = true,
+	LOOKAHEAD_TIME = 0.6,          -- seconds of running ahead that are checked
+	MIN_LOOKAHEAD = 4,             -- studs, at least
+	MAX_DETOUR = 8,                -- the furthest out from the wall it will move your line
+	DETOUR_STEP = 0.5,
+	BODY_RADIUS = 1.2,             -- body size for "will I hit it" (your body is ~1; a little margin)
+	HUG_LOOKAHEAD = 2.5,           -- how sharply it pulls you back in to the wall (shorter = tighter)
+	BODY_HEIGHTS = { 2.0, 3.5 },   -- above your feet: things lower than ~1 stud you just step over
+	RETURN_DELAY = 0.12,           -- the way back to the wall must be clear this long before moving back in
+
+	-- what counts as a wall
+	RAY_COUNT = 24,                -- rays around you
+	WALL_LOW = 2.0,                -- heights above your feet where walls are checked
+	WALL_HIGH = 3.5,               -- (shorter than WALL_HIGH = not a wall: stairs, curbs, short blocks)
+	WALL_SLANT = 0.8,              -- both heights must hit within this of each other (stairs don't)
+	WALL_MAX_SLOPE = 75,           -- steeper than this (degrees) = wall; anything you can walk up = floor
+}
+controller.Config = CONFIG
+
+------------------------------------------------------------------------
+-- STATE
+------------------------------------------------------------------------
+local running, enabled = true, true
 local connections = {}
 local char, hrp, humanoid
-local lastWall = nil
-local lastWallSeenTime = 0
-local lastObstacleClearAttempt = 0
+local lastWall = nil        -- { point, part, seen }
+local smoothDir = nil
+local TWO_PI = 2 * math.pi
+local detour = 0            -- how far out from the wall your line currently is (studs)
+local returnTimer = 0
+local lastAvoidCheck = 0
 
-local function safeRaycast(origin, dir, params)
-    local ok, res = pcall(function()
-        return workspace:Raycast(origin, dir, params)
-    end)
-    if ok then return res else return nil end
+-- one RaycastParams, reused (the original made a new one for every ray)
+local params = RaycastParams.new()
+params.FilterType = Enum.RaycastFilterType.Exclude
+params.IgnoreWater = true
+params.RespectCanCollide = true -- walk-through decorations don't count
+
+-- follow a path of names down from Workspace (nil if it doesn't exist right now, e.g. map not loaded)
+local function findPath(names)
+	local inst = workspace
+	for _, name in ipairs(names) do
+		inst = inst:FindFirstChild(name)
+		if not inst then return nil end
+	end
+	return inst
 end
 
-local function getMoveDirection()
-    if humanoid and humanoid.MoveDirection and humanoid.MoveDirection.Magnitude > 0.001 then
-        return humanoid.MoveDirection.Unit
-    end
-    local x, z = 0, 0
-    if UserInputService:IsKeyDown(Enum.KeyCode.W) then z = z - 1 end
-    if UserInputService:IsKeyDown(Enum.KeyCode.S) then z = z + 1 end
-    if UserInputService:IsKeyDown(Enum.KeyCode.A) then x = x - 1 end
-    if UserInputService:IsKeyDown(Enum.KeyCode.D) then x = x + 1 end
-    local v = Vector3.new(x, 0, z)
-    if v.Magnitude > 0.001 then
-        local cam = workspace.CurrentCamera
-        if cam then
-            local look = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
-            if look.Magnitude < 0.001 then look = Vector3.new(0,0,-1) end
-            look = look.Unit
-            local right = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
-            if right.Magnitude < 0.001 then right = Vector3.new(1,0,0) end
-            right = right.Unit
-            return (look * -v.Z + right * v.X).Unit
-        end
-        return v.Unit
-    end
-    return Vector3.new(0,0,0)
+local lastFilterRefresh = 0
+local function refreshFilter()
+	local list = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Character then table.insert(list, p.Character) end
+	end
+	-- ignored folders (looked up again every refresh, so it works when the map reloads)
+	for _, path in ipairs(CONFIG.IGNORE_PATHS) do
+		local inst = findPath(path)
+		if inst then table.insert(list, inst) end
+	end
+	params.FilterDescendantsInstances = list
+end
+refreshFilter()
+
+------------------------------------------------------------------------
+-- HELPERS
+------------------------------------------------------------------------
+local function flat(v)
+	return Vector3.new(v.X, 0, v.Z)
 end
 
-local function detectWall()
-    if not hrp or not char then return nil end
-    local originBase = hrp.Position
-    local params = RaycastParams.new()
-    params.FilterDescendantsInstances = {char}
-    params.FilterType = Enum.RaycastFilterType.Blacklist
-    params.IgnoreWater = true
-    local rightVec = hrp.CFrame.RightVector
-    local leftVec = -hrp.CFrame.RightVector
-    local lookVec = hrp.CFrame.LookVector
-    local function sampleSide(sideDir)
-        local totalWeight = 0
-        local weightedNormal = Vector3.new(0,0,0)
-        local weightedPos = Vector3.new(0,0,0)
-        local hitCount = 0
-        local totalDist = 0
-        for _, fh in ipairs(FORWARD_OFFSETS) do
-            for _, h in ipairs(RAY_HEIGHTS) do
-                local sampleOrigin = originBase + lookVec * fh + Vector3.new(0, h, 0)
-                local offsetSide = sampleOrigin + (hrp.CFrame.RightVector * SIDE_SAMPLE_RADIUS * (sideDir == rightVec and 1 or -1))
-                local dir = sideDir * STICK_DETECT_DISTANCE
-                local hit = safeRaycast(offsetSide, dir, params)
-                if hit and hit.Instance then
-                    local dist = (hit.Position - offsetSide).Magnitude
-                    local weight = 1 / math.max(dist, 0.001)
-                    weightedNormal = weightedNormal + hit.Normal * weight
-                    weightedPos = weightedPos + hit.Position * weight
-                    totalWeight = totalWeight + weight
-                    totalDist = totalDist + dist
-                    hitCount = hitCount + 1
-                end
-            end
-        end
-        if hitCount < MIN_HIT_COUNT_TO_ACCEPT then return nil end
-        local avgNormal = (weightedNormal / totalWeight)
-        if avgNormal.Magnitude < 0.001 then return nil end
-        avgNormal = avgNormal.Unit
-        local avgPos = (weightedPos / totalWeight)
-        local avgDist = totalDist / hitCount
-        return {normal = avgNormal, position = avgPos, dist = avgDist, hits = hitCount}
-    end
-    local r = sampleSide(rightVec)
-    local l = sampleSide(leftVec)
-    local choose = nil
-    if r and l then
-        if r.hits > l.hits then choose = {side="Right", hit=r}
-        elseif l.hits > r.hits then choose = {side="Left", hit=l}
-        else choose = (r.dist <= l.dist) and {side="Right", hit=r} or {side="Left", hit=l} end
-    elseif r then choose = {side="Right", hit=r}
-    elseif l then choose = {side="Left", hit=l}
-    end
-    if not choose then return nil end
-    if math.abs(choose.hit.normal.Y) > WALL_NORMAL_Y_THRESHOLD and choose.hit.hits < (SAMPLES_PER_SIDE * 0.6) then
-        return nil
-    end
-    return {
-        side = choose.side,
-        normal = choose.hit.normal,
-        position = choose.hit.position,
-        avgDist = choose.hit.dist,
-        hitCount = choose.hit.hits,
-        timestamp = tick()
-    }
-end
-
-local function pathBlocked(a, b)
-    local dir = b - a
-    local dist = dir.Magnitude
-    if dist < 0.0001 then return false, nil end
-    local params = RaycastParams.new()
-    params.FilterDescendantsInstances = {char}
-    params.FilterType = Enum.RaycastFilterType.Blacklist
-    params.IgnoreWater = true
-    local hit = safeRaycast(a, dir.Unit * dist, params)
-    if hit and hit.Instance then
-        return true, hit
-    end
-    return false, nil
-end
-
-local function computeAlternateMove(hrpPos, targetPos, lastWall, playerMoveDir, allowedMoveDist)
-    local tangent = lastWall.normal:Cross(Vector3.new(0,1,0))
-    if tangent.Magnitude > 0.001 then tangent = tangent.Unit end
-    local sign = 1
-    if playerMoveDir.Magnitude > 0.001 then
-        if playerMoveDir:Dot(tangent) < 0 then sign = -1 end
-    end
-    local slideDir = tangent * sign
-    slideDir = Vector3.new(slideDir.X, 0, slideDir.Z)
-    if slideDir.Magnitude > 0.001 then slideDir = slideDir.Unit end
-    local slideTarget = hrpPos + slideDir * math.min(AVOID_SHIFT_AMOUNT, allowedMoveDist)
-    local blocked, hit = pathBlocked(hrpPos, slideTarget)
-    if not blocked then return slideTarget end
-    local oppSlide = hrpPos - slideDir * math.min(AVOID_SHIFT_AMOUNT, allowedMoveDist)
-    local blocked2, hit2 = pathBlocked(hrpPos, oppSlide)
-    if not blocked2 then return oppSlide end
-    local otherDetected = detectWall()
-    if otherDetected and otherDetected.side ~= lastWall.side then
-        local lateralVec = hrpPos - otherDetected.position
-        local lateralDist = lateralVec:Dot(otherDetected.normal)
-        local altTarget = hrpPos - otherDetected.normal * (lateralDist - DESIRED_WALL_DISTANCE)
-        altTarget = Vector3.new(altTarget.X, hrpPos.Y, altTarget.Z)
-        local blocked3, _ = pathBlocked(hrpPos, altTarget)
-        if not blocked3 then return altTarget end
-    end
-    local backPos = hrpPos - playerMoveDir * math.min(allowedMoveDist, 0.4)
-    local blocked4, _ = pathBlocked(hrpPos, backPos)
-    if not blocked4 then return backPos end
-    return nil
-end
-
-local function cleanup()
-    running = false
-    for _, c in ipairs(connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    connections = {}
-    if controller then controller.Cleanup = nil end
-    if _G.AutoWallStickController == controller then _G.AutoWallStickController = nil end
-end
-controller.Cleanup = cleanup
-
-local function onCharacterAdded(c)
-    char = c
-    humanoid = char:WaitForChild("Humanoid", 5)
-    hrp = char:WaitForChild("HumanoidRootPart", 5)
-    lastWall = nil
-end
-if player.Character then onCharacterAdded(player.Character) end
-connections[#connections+1] = player.CharacterAdded:Connect(onCharacterAdded)
-
-connections[#connections+1] = RunService.RenderStepped:Connect(function(dt)
-    if not running then return end
-    if not char or not hrp or not humanoid then return end
-    if humanoid.Health <= 0 then return end
-    local moveDir = getMoveDirection()
-    local moveMag = moveDir.Magnitude
-    local walkSpeed = math.max(0.1, humanoid.WalkSpeed or 16)
-    local detected = detectWall()
-    if detected then
-        lastWall = detected
-        lastWallSeenTime = tick()
-    else
-        if lastWall and (tick() - lastWallSeenTime) < GRACE_KEEP_SECONDS then
-        else
-            lastWall = nil
-        end
-    end
-    if lastWall then
-        local lateralVec = hrp.Position - lastWall.position
-        local lateralDist = lateralVec:Dot(lastWall.normal)
-        local movingAwayDot = 0
-        if moveMag > 0.001 then movingAwayDot = moveDir:Dot(-lastWall.normal) end
-        local wallTangent = lastWall.normal:Cross(Vector3.new(0,1,0))
-        if wallTangent.Magnitude > 0.001 then wallTangent = wallTangent.Unit end
-        local wallTangentParallel = 0
-        if moveMag > 0.001 and wallTangent.Magnitude > 0.001 then
-            wallTangentParallel = math.abs(moveDir:Dot(wallTangent))
-        end
-        local shouldStick = false
-        if moveMag > MIN_MOVE_TO_STICK then
-            if wallTangentParallel >= ALLOW_STICK_ANGLE then shouldStick = true end
-            if movingAwayDot > 0.2 then shouldStick = true end
-            if lateralDist < (DESIRED_WALL_DISTANCE + 0.8) then shouldStick = true end
-            if movingAwayDot < LEAVE_THRESHOLD then shouldStick = false end
-        else
-            if lateralDist < (DESIRED_WALL_DISTANCE + 0.5) then shouldStick = true end
-        end
-        if shouldStick then
-            local desiredTarget = hrp.Position - lastWall.normal * (lateralDist - DESIRED_WALL_DISTANCE)
-            desiredTarget = Vector3.new(desiredTarget.X, hrp.Position.Y, desiredTarget.Z)
-            local intendedSpeed = walkSpeed
-            if moveMag > 0.001 then
-                intendedSpeed = walkSpeed * math.clamp(moveMag, 0, 1)
-            end
-            local allowedMoveDist = math.min(intendedSpeed * dt, MAX_SHIFT_PER_FRAME)
-            local toTarget = Vector3.new(desiredTarget.X - hrp.Position.X, 0, desiredTarget.Z - hrp.Position.Z)
-            local distToTarget = toTarget.Magnitude
-            if distToTarget > 0.001 then
-                local lateralShift = toTarget
-                if moveMag > 0.001 then
-                    local forwardProj = moveDir * (toTarget:Dot(moveDir))
-                    lateralShift = toTarget - forwardProj
-                end
-                if moveMag <= 0.001 then lateralShift = toTarget end
-                local lateralMag = lateralShift.Magnitude
-                local candidatePos = hrp.Position
-                if lateralMag > 0.001 then
-                    local lateralDir = lateralShift.Unit
-                    local lateralMove = math.min(lateralMag, allowedMoveDist)
-                    candidatePos = hrp.Position + lateralDir * lateralMove
-                else
-                    candidatePos = hrp.Position
-                end
-                local blocked, hit = pathBlocked(hrp.Position, candidatePos)
-                if blocked then
-                    local alt = computeAlternateMove(hrp.Position, desiredTarget, lastWall, moveDir, allowedMoveDist)
-                    if alt then candidatePos = alt else candidatePos = hrp.Position end
-                end
-                local lerpSpeed = STICK_LERP_SPEED
-                if distToTarget < 0.45 then lerpSpeed = AGGRESSIVE_LERP_SPEED end
-                local lerpFactor = math.clamp(1 - math.exp(-lerpSpeed * dt), 0, 1)
-                local newPos = hrp.Position:Lerp(candidatePos, lerpFactor)
-                if (newPos - hrp.Position).Magnitude > 0.0007 then
-                    local look = hrp.CFrame.LookVector
-                    local newCf = CFrame.new(newPos, newPos + Vector3.new(look.X, 0, look.Z))
-                    hrp.CFrame = newCf
-                end
-            end
-        else
-            if lastWall and (tick() - lastWallSeenTime) >= GRACE_KEEP_SECONDS then
-                lastWall = nil
-            end
-        end
-    end
+local controls, cameras = nil, nil
+pcall(function()
+	local ps = player:WaitForChild("PlayerScripts", 5)
+	local pm = ps and ps:WaitForChild("PlayerModule", 5)
+	if pm then
+		local mod = require(pm)
+		controls = mod:GetControls()
+		pcall(function() cameras = mod:GetCameras() end)
+	end
 end)
 
+-- your input as a world direction (+ how hard you're pushing)
+local function getInput()
+	local v = nil
+	if controls then
+		local ok, mv = pcall(controls.GetMoveVector, controls)
+		if ok and typeof(mv) == "Vector3" then v = mv end
+	end
+	if not v then
+		local x, z = 0, 0
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then z -= 1 end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then z += 1 end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then x -= 1 end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then x += 1 end
+		v = Vector3.new(x, 0, z)
+	end
+	local mag = v.Magnitude
+	if mag < 0.05 then return nil, 0 end
+	local cam = workspace.CurrentCamera
+	if not cam then return nil, 0 end
+	local look, right = flat(cam.CFrame.LookVector), flat(cam.CFrame.RightVector)
+	if look.Magnitude < 1e-3 or right.Magnitude < 1e-3 then return nil, 0 end
+	local w = right.Unit * v.X + look.Unit * -v.Z
+	if w.Magnitude < 1e-3 then return nil, 0 end
+	return w.Unit, math.min(mag, 1)
+end
+
+local function isShiftLocked()
+	local mlc = cameras and cameras.activeMouseLockController
+	if mlc and mlc.GetIsMouseLocked then
+		local ok, v = pcall(mlc.GetIsMouseLocked, mlc)
+		if ok then return v == true end
+	end
+	local cam = workspace.CurrentCamera
+	return UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter
+		and cam ~= nil and (cam.Focus.Position - cam.CFrame.Position).Magnitude > 1.5
+end
+
+local function getFeetY()
+	local hit = workspace:Raycast(hrp.Position, Vector3.new(0, -12, 0), params)
+	if hit then return hit.Position.Y end
+	local offset = (humanoid.RigType == Enum.HumanoidRigType.R6) and 3 or (humanoid.HipHeight + hrp.Size.Y / 2)
+	return hrp.Position.Y - offset
+end
+
+local function isSteep(hit)
+	if not hit then return false end
+	local slope = math.min(humanoid.MaxSlopeAngle or 89, CONFIG.WALL_MAX_SLOPE)
+	return math.abs(hit.Normal.Y) < math.cos(math.rad(slope))
+end
+
+------------------------------------------------------------------------
+-- WALL DETECTION: closest point of a real wall, all around you
+------------------------------------------------------------------------
+local function castAt(center, feetY, dir, range)
+	local low = workspace:Raycast(Vector3.new(center.X, feetY + CONFIG.WALL_LOW, center.Z), dir * range, params)
+	if not isSteep(low) then return nil end
+	local d = flat(low.Position - center).Magnitude
+	-- tall + straight up: the same direction must also be blocked higher up, at about the same distance
+	local high = workspace:Raycast(Vector3.new(center.X, feetY + CONFIG.WALL_HIGH, center.Z),
+		dir * (d + CONFIG.WALL_SLANT), params)
+	if not isSteep(high) then return nil end
+	return low, d
+end
+
+local function findWall(center, feetY, extraRange, lockToLast)
+	local range = CONFIG.STICK_DETECT_DISTANCE + 0.5 + (extraRange or 0)
+	local n = CONFIG.RAY_COUNT
+	local step = TWO_PI / n
+	local best, bestD, bestA = nil, math.huge, 0
+	local onLast, onLastD = nil, math.huge
+	for i = 0, n - 1 do
+		local a = i * step
+		local hit, d = castAt(center, feetY, Vector3.new(math.sin(a), 0, math.cos(a)), range)
+		if hit then
+			if d < bestD then best, bestD, bestA = hit, d, a end
+			if lastWall and hit.Instance == lastWall.part and d < onLastD then onLast, onLastD = hit, d end
+		end
+	end
+	if not best then return nil end
+	-- refine the closest direction (accurate at corners)
+	for _, f in ipairs({ -0.5, -0.25, 0.25, 0.5 }) do
+		local a = bestA + f * step
+		local hit, d = castAt(center, feetY, Vector3.new(math.sin(a), 0, math.cos(a)), range)
+		if hit and d < bestD then best, bestD = hit, d end
+	end
+	-- stay on the wall you're on unless another one is clearly closer (no flip-flop in corridors);
+	-- while going round something, always stay on it (the thing you're passing must not take over)
+	if onLast and onLast.Instance ~= best.Instance and (lockToLast or onLastD < bestD + CONFIG.SWITCH_MARGIN) then
+		best, bestD = onLast, onLastD
+	end
+	return best, bestD
+end
+
+------------------------------------------------------------------------
+-- GETTING PAST THINGS ALONG THE WALL
+------------------------------------------------------------------------
+-- Is the straight line from you to `to` clear for your body? (knee + waist height; things you can walk on don't count)
+local function bodyLineClear(center, feetY, to)
+	local delta = flat(to - center)
+	if delta.Magnitude < 0.05 then return true end
+	for _, h in ipairs(CONFIG.BODY_HEIGHTS) do
+		local hit = workspace:Spherecast(Vector3.new(center.X, feetY + h, center.Z), CONFIG.BODY_RADIUS, delta, params)
+		if hit and isSteep(hit) then return false end
+	end
+	return true
+end
+
+-- Smallest offset from the wall (0, DETOUR_STEP, ... MAX_DETOUR) whose line ahead is clear.
+-- Returns the offset and the point to head for, or nil if nothing within MAX_DETOUR gets past.
+local function findLane(center, feetY, tangent, rhat, dist, lookahead)
+	local k = 0
+	while k <= CONFIG.MAX_DETOUR + 1e-6 do
+		local lanePoint = center + tangent * lookahead + rhat * (CONFIG.DESIRED_WALL_DISTANCE + k - dist)
+		if bodyLineClear(center, feetY, lanePoint) then return k, lanePoint end
+		k += CONFIG.DETOUR_STEP
+	end
+	return nil
+end
+
+------------------------------------------------------------------------
+-- STEERING
+------------------------------------------------------------------------
+local function steer(dir, mag, dt)
+	if smoothDir then
+		local b = smoothDir:Lerp(dir, 1 - math.exp(-dt / CONFIG.STEER_SMOOTHING))
+		if b.Magnitude > 1e-3 then dir = b.Unit end
+	end
+	smoothDir = dir
+	humanoid:Move(dir * mag, false)
+end
+
+local function onStep(dt)
+	if not running or not enabled then return end
+	if not (char and hrp and humanoid and hrp.Parent) or humanoid.Health <= 0 then return end
+	local now = os.clock()
+	if now - lastFilterRefresh > 1 then
+		lastFilterRefresh = now
+		refreshFilter()
+	end
+
+	if CONFIG.SHIFTLOCK_DISABLES and isShiftLocked() then
+		lastWall, smoothDir = nil, nil
+		return
+	end
+	local move, mag = getInput()
+	if not move or humanoid.FloorMaterial == Enum.Material.Air then
+		smoothDir = nil
+		if not move then detour = 0 end
+		return -- not moving / in the air: leave you alone
+	end
+
+	local center = hrp.Position
+	local feetY = getFeetY()
+	local hit, dist = findWall(center, feetY, detour, detour > 0)
+	if hit then
+		lastWall = { point = hit.Position, part = hit.Instance, seen = now }
+	elseif lastWall and now - lastWall.seen < CONFIG.GRACE_KEEP_SECONDS then
+		dist = flat(center - lastWall.point).Magnitude
+	else
+		lastWall, smoothDir, detour = nil, nil, 0
+		return
+	end
+	if dist > CONFIG.STICK_DETECT_DISTANCE + detour then
+		smoothDir, detour = nil, 0
+		return
+	end
+
+	-- the wall's direction at the closest point: rhat points from the wall to you
+	local r = flat(center - lastWall.point)
+	if r.Magnitude < 1e-3 then return end
+	local rhat = r.Unit
+	local away = move:Dot(rhat)
+	if away > CONFIG.LEAVE_DOT then
+		smoothDir, detour = nil, 0
+		return -- you're steering away from it: let go
+	end
+	local tangent = Vector3.new(-rhat.Z, 0, rhat.X)
+	local along = move:Dot(tangent)
+	if along < 0 then
+		tangent, along = -tangent, -along
+	end
+	if along < CONFIG.MIN_ALONG and away > -0.5 then
+		smoothDir, detour = nil, 0
+		return -- not really moving along it
+	end
+
+	local dir
+	if CONFIG.AVOID then
+		-- something in the way further along the wall? pick the lane that gets past it
+		local lookahead = math.max(CONFIG.MIN_LOOKAHEAD, humanoid.WalkSpeed * mag * CONFIG.LOOKAHEAD_TIME)
+		if now - lastAvoidCheck >= 0.05 then
+			lastAvoidCheck = now
+			local k = findLane(center, feetY, tangent, rhat, dist, lookahead)
+			if not k then
+				k = 0 -- nothing nearby gets past (inside corner / big structure): no detour
+			end
+			if k > detour then
+				detour, returnTimer = k, 0 -- move out right away
+			elseif k < detour then
+				returnTimer += 0.05
+				if returnTimer >= CONFIG.RETURN_DELAY then
+					detour, returnTimer = k, 0 -- the way back in has been clear for a moment
+				end
+			else
+				returnTimer = 0
+			end
+		end
+		-- always head along a line that's been checked clear: get onto the lane sharply (short line)
+		-- if that's clear, otherwise along the long checked lane line
+		local offset = CONFIG.DESIRED_WALL_DISTANCE + detour - dist
+		local short = center + tangent * CONFIG.HUG_LOOKAHEAD + rhat * offset
+		if bodyLineClear(center, feetY, short) then
+			dir = flat(short - center)
+		else
+			dir = flat(tangent * lookahead + rhat * offset)
+		end
+	else
+		-- slide along the wall, pulled/pushed to DESIRED_WALL_DISTANCE
+		local correction = math.clamp(-(dist - CONFIG.DESIRED_WALL_DISTANCE) * CONFIG.DISTANCE_GAIN,
+			-CONFIG.MAX_CORRECTION, CONFIG.MAX_CORRECTION)
+		dir = tangent + rhat * correction
+	end
+	if dir.Magnitude < 1e-3 then return end
+	steer(dir.Unit, mag, dt)
+end
+
+------------------------------------------------------------------------
+-- LIFECYCLE
+------------------------------------------------------------------------
+local function onCharacterAdded(c)
+	char = c
+	humanoid = c:WaitForChild("Humanoid", 5)
+	hrp = c:WaitForChild("HumanoidRootPart", 5)
+	lastWall, smoothDir = nil, nil
+	refreshFilter()
+end
+if player.Character then task.spawn(onCharacterAdded, player.Character) end
+connections[#connections + 1] = player.CharacterAdded:Connect(onCharacterAdded)
+
+connections[#connections + 1] = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed or not running then return end
+	if input.KeyCode == CONFIG.TOGGLE_KEY then
+		enabled = not enabled
+		lastWall, smoothDir = nil, nil
+		print("[AutoWallStick] " .. (enabled and "on" or "off"))
+	end
+end)
+
+-- runs right after the default controls, so our Move wins
+local STEP_NAME = "AutoWallStickSteer"
+local lastErrorWarn = 0
+pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
+RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Input.Value + 1, function(dt)
+	local ok, err = pcall(onStep, dt)
+	if not ok and os.clock() - lastErrorWarn > 2 then
+		lastErrorWarn = os.clock()
+		warn("[AutoWallStick] " .. tostring(err))
+	end
+end)
+
+local function cleanup()
+	running = false
+	pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(connections)
+	if _G.AutoWallStickController == controller then _G.AutoWallStickController = nil end
+end
 controller.Cleanup = cleanup
 
-if RunService:IsStudio() then
-    warn("[AutoWallStick_PersistAcrossRespawn] running. Re-run kills previous instance. Persists across respawn.")
+print("[AutoWallStick] running. Move along a wall to stick to it. Z = on/off.")
 end
-end
-
