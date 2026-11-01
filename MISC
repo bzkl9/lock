@@ -1,0 +1,281 @@
+
+--// KILLER SPEED MULTIPLIER NOTIFIER
+--// LocalScript - StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local TRACKED = {
+    ["UnstableEye"] = true,
+    ["666BloodHuntStart"] = true,
+    ["NosFlying"] = true,
+    ["ObservantTeleporting"] = true,
+    ["404Error"] = true,
+    ["ENRAGED"] = true,
+}
+
+local DURATION = 5
+local FADE_DURATION = 0.45
+local MAX_NOTIFICATIONS = 7
+
+--// GUI
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local oldGui = playerGui:FindFirstChild("KillerMultiplierNotifier")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "KillerMultiplierNotifier"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.DisplayOrder = 100
+gui.Parent = playerGui
+
+local container = Instance.new("Frame")
+container.Name = "Notifications"
+container.AnchorPoint = Vector2.new(1, 0)
+container.Position = UDim2.new(1, -16, 0, 16)
+container.Size = UDim2.new(0, 285, 0, 500)
+container.BackgroundTransparency = 1
+container.Parent = gui
+
+local layout = Instance.new("UIListLayout")
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 7)
+layout.Parent = container
+
+local function addCorner(parent, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius)
+    corner.Parent = parent
+end
+
+--// Notifications
+local notificationCount = 0
+
+local function notify(killerName, multiplierName)
+    notificationCount += 1
+
+    local card = Instance.new("Frame")
+    card.Name = multiplierName
+    card.Size = UDim2.new(1, 0, 0, 65)
+    card.BackgroundColor3 = Color3.fromRGB(20, 22, 30)
+    card.BackgroundTransparency = 0.08
+    card.BorderSizePixel = 0
+    card.LayoutOrder = -notificationCount
+    card.Parent = container
+    addCorner(card, 8)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(235, 70, 85)
+    stroke.Thickness = 1.4
+    stroke.Transparency = 0.15
+    stroke.Parent = card
+
+    local title = Instance.new("TextLabel")
+    title.Name = "MultiplierName"
+    title.Position = UDim2.new(0, 12, 0, 7)
+    title.Size = UDim2.new(1, -75, 0, 24)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.Text = multiplierName
+    title.TextColor3 = Color3.fromRGB(255, 100, 110)
+    title.TextSize = 15
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    title.Parent = card
+
+    local subtitle = Instance.new("TextLabel")
+    subtitle.Name = "KillerName"
+    subtitle.Position = UDim2.new(0, 12, 0, 32)
+    subtitle.Size = UDim2.new(1, -24, 0, 18)
+    subtitle.BackgroundTransparency = 1
+    subtitle.Font = Enum.Font.Gotham
+    subtitle.Text = "Killer: " .. killerName
+    subtitle.TextColor3 = Color3.fromRGB(195, 195, 205)
+    subtitle.TextSize = 12
+    subtitle.TextXAlignment = Enum.TextXAlignment.Left
+    subtitle.TextTruncate = Enum.TextTruncate.AtEnd
+    subtitle.Parent = card
+
+    local timerLabel = Instance.new("TextLabel")
+    timerLabel.Name = "Stopwatch"
+    timerLabel.Position = UDim2.new(1, -66, 0, 8)
+    timerLabel.Size = UDim2.new(0, 55, 0, 24)
+    timerLabel.BackgroundTransparency = 1
+    timerLabel.Font = Enum.Font.GothamBold
+    timerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    timerLabel.TextSize = 17
+    timerLabel.TextXAlignment = Enum.TextXAlignment.Right
+    timerLabel.Parent = card
+
+    local progressBackground = Instance.new("Frame")
+    progressBackground.Position = UDim2.new(0, 12, 1, -7)
+    progressBackground.Size = UDim2.new(1, -24, 0, 3)
+    progressBackground.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+    progressBackground.BorderSizePixel = 0
+    progressBackground.Parent = card
+    addCorner(progressBackground, 3)
+
+    local progress = Instance.new("Frame")
+    progress.Size = UDim2.fromScale(1, 1)
+    progress.BackgroundColor3 = Color3.fromRGB(255, 90, 100)
+    progress.BorderSizePixel = 0
+    progress.Parent = progressBackground
+    addCorner(progress, 3)
+
+    TweenService:Create(
+        progress,
+        TweenInfo.new(DURATION, Enum.EasingStyle.Linear),
+        {Size = UDim2.fromScale(0, 1)}
+    ):Play()
+
+    -- Keep the GUI from accumulating too many cards
+    local cards = {}
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Frame") then
+            table.insert(cards, child)
+        end
+    end
+
+    if #cards > MAX_NOTIFICATIONS then
+        table.sort(cards, function(a, b)
+            return a.LayoutOrder > b.LayoutOrder
+        end)
+
+        for i = MAX_NOTIFICATIONS + 1, #cards do
+            cards[i]:Destroy()
+        end
+    end
+
+    -- Countdown
+    task.spawn(function()
+        local startTime = os.clock()
+
+        while card.Parent do
+            local elapsed = os.clock() - startTime
+            local remaining = math.max(0, DURATION - elapsed)
+
+            timerLabel.Text = string.format("%.1fs", remaining)
+
+            if remaining <= 0 then
+                break
+            end
+
+            task.wait(0.05)
+        end
+
+        if not card.Parent then
+            return
+        end
+
+        -- Fade out
+        local fadeInfo = TweenInfo.new(
+            FADE_DURATION,
+            Enum.EasingStyle.Quad,
+            Enum.EasingDirection.Out
+        )
+
+        local objects = {
+            card,
+            title,
+            subtitle,
+            timerLabel,
+            progressBackground,
+            progress,
+            stroke,
+        }
+
+        for _, obj in ipairs(objects) do
+            local goal = {}
+
+            if obj:IsA("Frame") then
+                goal.BackgroundTransparency = 1
+            elseif obj:IsA("TextLabel") then
+                goal.TextTransparency = 1
+            elseif obj:IsA("UIStroke") then
+                goal.Transparency = 1
+            end
+
+            TweenService:Create(obj, fadeInfo, goal):Play()
+        end
+
+        task.wait(FADE_DURATION)
+
+        if card.Parent then
+            card:Destroy()
+        end
+    end)
+end
+
+--// MONITORING
+local observedMultipliers = setmetatable({}, {__mode = "k"})
+local observedFolders = setmetatable({}, {__mode = "k"})
+local observedKillers = setmetatable({}, {__mode = "k"})
+
+local function detectMultiplier(instance, killerName)
+    if not TRACKED[instance.Name] then
+        return
+    end
+
+    if observedMultipliers[instance] then
+        return
+    end
+
+    observedMultipliers[instance] = true
+    notify(killerName, instance.Name)
+end
+
+local function monitorSpeedMultipliers(folder, killerName)
+    if observedFolders[folder] then
+        return
+    end
+
+    observedFolders[folder] = true
+
+    -- Detect existing multipliers
+    for _, instance in ipairs(folder:GetChildren()) do
+        detectMultiplier(instance, killerName)
+    end
+
+    -- Detect future multipliers
+    folder.ChildAdded:Connect(function(instance)
+        detectMultiplier(instance, killerName)
+    end)
+end
+
+local function monitorKiller(killer)
+    if observedKillers[killer] then
+        return
+    end
+
+    observedKillers[killer] = true
+
+    local existingFolder = killer:FindFirstChild("SpeedMultipliers")
+
+    if existingFolder then
+        monitorSpeedMultipliers(existingFolder, killer.Name)
+    end
+
+    killer.ChildAdded:Connect(function(child)
+        if child.Name == "SpeedMultipliers" then
+            monitorSpeedMultipliers(child, killer.Name)
+        end
+    end)
+end
+
+--// START
+task.spawn(function()
+    local playersFolder = workspace:WaitForChild("Players")
+    local killersFolder = playersFolder:WaitForChild("Killers")
+
+    for _, killer in ipairs(killersFolder:GetChildren()) do
+        monitorKiller(killer)
+    end
+
+    killersFolder.ChildAdded:Connect(monitorKiller)
+end)
